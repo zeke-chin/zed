@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use editor::{EditPredictionRequestTrigger, Editor, hover_popover::ForkHoverLinkHandler};
-use gpui::{App, Context, Global, WeakEntity, Window};
+use gpui::{AnyWindowHandle, App, Context, Global, WeakEntity, Window};
 use settings::{
     ForkEditPredictionProvider, KeybindSource, KeymapFile, KeymapFileLoadResult, RegisterSetting,
-    Settings, SettingsContent,
+    Settings, SettingsContent, SettingsStore,
 };
 use workspace::{AppState, Workspace};
 
@@ -34,7 +34,7 @@ impl Settings for ForkSettings {
 /// edit prediction providers to these itself when its own settings change, so
 /// it doesn't depend on the official registry's editor list.
 #[derive(Default)]
-struct ForkEditors(Vec<WeakEntity<Editor>>);
+struct ForkEditors(Vec<(WeakEntity<Editor>, AnyWindowHandle)>);
 
 impl Global for ForkEditors {}
 
@@ -42,6 +42,7 @@ pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
     fork_copy_anchor::init(cx);
     fork_json_explorer::init(cx);
     fork_windsurf::init(cx);
+    observe_edit_prediction_settings(cx);
     cx.set_global(ForkHoverLinkHandler(handle_hover_link));
 
     cx.observe_new(|editor: &mut Editor, window, cx: &mut Context<Editor>| {
@@ -56,10 +57,7 @@ pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
             "fork_ext: attaching features to editor {:?}",
             cx.entity_id()
         );
-        let editor_handle = cx.entity().downgrade();
-        let editors = &mut cx.default_global::<ForkEditors>().0;
-        editors.retain(|editor| editor.upgrade().is_some());
-        editors.push(editor_handle);
+        remember_editor(cx.entity().downgrade(), window.window_handle(), cx);
 
         fork_copy_anchor::attach_editor(editor, window, cx);
         fork_json_explorer::attach_editor(editor, window, cx);
@@ -73,6 +71,7 @@ pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
             };
             fork_copy_anchor::status_items(workspace, window, cx);
             fork_json_explorer::status_items(workspace, window, cx);
+            fork_windsurf::status_items(workspace, window, cx);
         },
     )
     .detach();
@@ -88,16 +87,78 @@ fn handle_hover_link(link: &str, window: &mut Window, cx: &mut App) -> bool {
     false
 }
 
+fn remember_editor(editor: WeakEntity<Editor>, window: AnyWindowHandle, cx: &mut App) {
+    let editors = &mut cx.default_global::<ForkEditors>().0;
+    editors.retain(|(editor, _)| editor.upgrade().is_some());
+    editors.push((editor, window));
+}
+
+fn fork_provides_edit_predictions(cx: &App) -> bool {
+    ForkSettings::get_global(cx).edit_prediction_provider == ForkEditPredictionProvider::Windsurf
+        && fork_windsurf::should_provide_predictions(cx)
+}
+
 /// Called at the start of the official registry's provider assignment.
 /// Returns `true` when the fork installed its own provider, in which case the
 /// official assignment is skipped.
 pub fn assign_edit_prediction_provider(
-    _editor: &mut Editor,
-    _trigger: EditPredictionRequestTrigger,
-    _window: &mut Window,
-    _cx: &mut Context<Editor>,
+    editor: &mut Editor,
+    trigger: EditPredictionRequestTrigger,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
 ) -> bool {
-    false
+    fork_provides_edit_predictions(cx)
+        && fork_windsurf::assign_delegate(editor, trigger, window, cx)
+}
+
+/// The official registry only reassigns providers when the official setting
+/// changes, so the fork does the same for its own settings: editors get the
+/// Windsurf delegate when it becomes active and lose it when it stops being
+/// active. The official provider is only reinstalled the next time the
+/// official registry assigns one (a new editor, or a change to
+/// `edit_predictions.provider`).
+fn observe_edit_prediction_settings(cx: &mut App) {
+    let windsurf_selected = |cx: &App| {
+        ForkSettings::get_global(cx).edit_prediction_provider
+            == ForkEditPredictionProvider::Windsurf
+    };
+    fork_windsurf::set_selected(windsurf_selected(cx), cx);
+    let mut provided = fork_provides_edit_predictions(cx);
+    cx.observe_global::<SettingsStore>(move |cx| {
+        fork_windsurf::set_selected(windsurf_selected(cx), cx);
+        let provides = fork_provides_edit_predictions(cx);
+        if provides == provided {
+            return;
+        }
+        provided = provides;
+        reassign_edit_prediction_providers(provides, cx);
+    })
+    .detach();
+}
+
+fn reassign_edit_prediction_providers(provides: bool, cx: &mut App) {
+    let editors = cx
+        .try_global::<ForkEditors>()
+        .map(|editors| editors.0.clone())
+        .unwrap_or_default();
+    let trigger = EditPredictionRequestTrigger::SettingsChanged;
+    for (editor, window) in editors {
+        let Some(editor) = editor.upgrade() else {
+            continue;
+        };
+        let result = window.update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                if !provides {
+                    fork_windsurf::remove_delegate(editor, trigger, window, cx);
+                } else if !fork_windsurf::has_delegate(editor) {
+                    fork_windsurf::assign_delegate(editor, trigger, window, cx);
+                }
+            })
+        });
+        if let Err(error) = result {
+            log::debug!("fork_ext: skipping an editor whose window is gone: {error:#}");
+        }
+    }
 }
 
 /// Called from Zed's `load_default_keymap`, which runs after every
@@ -127,15 +188,20 @@ pub fn load_default_keymap(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use editor::{EditPredictionRequestTrigger, Editor};
     use fork_copy_anchor::CopyAnchorSettings;
     use fork_windsurf::WindsurfSettings;
-    use gpui::{App, TestAppContext, UpdateGlobal as _};
+    use gpui::{App, AppContext as _, TestAppContext, UpdateGlobal as _};
+    use language::Buffer;
     use settings::{
         ForkEditPredictionProvider, KeymapFile, KeymapFileLoadResult, Settings, SettingsStore,
         WindsurfBackend,
     };
 
-    use super::{ForkSettings, handle_hover_link};
+    use super::{
+        ForkSettings, assign_edit_prediction_provider, handle_hover_link,
+        observe_edit_prediction_settings, remember_editor,
+    };
 
     fn init_settings(cx: &mut App) {
         let store = SettingsStore::test(cx);
@@ -219,6 +285,84 @@ mod tests {
 
         assert!(result.result().is_err());
         assert!(CopyAnchorSettings::get_global(cx).enabled);
+    }
+
+    fn set_user_settings(settings: &str, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(settings, cx)
+                    .expect("user settings should load");
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn test_windsurf_delegate_follows_fork_settings(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            init_settings(cx);
+            cx.set_global(db::AppDatabase::test_new());
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            fork_windsurf::init(cx);
+            observe_edit_prediction_settings(cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("fn main() {}\n", cx));
+            Editor::for_buffer(buffer, None, window, cx)
+        });
+        let has_delegate = |cx: &mut TestAppContext| {
+            window
+                .read_with(cx, |editor, _| fork_windsurf::has_delegate(editor))
+                .expect("window should be open")
+        };
+        window
+            .update(cx, |editor, window, cx| {
+                remember_editor(cx.entity().downgrade(), window.window_handle(), cx);
+                // Without an API key the official assignment proceeds.
+                assert!(!assign_edit_prediction_provider(
+                    editor,
+                    EditPredictionRequestTrigger::EditorCreated,
+                    window,
+                    cx
+                ));
+            })
+            .expect("window should be open");
+        assert!(!has_delegate(cx));
+
+        set_user_settings(r#"{ "fork": { "windsurf": { "api_key": "secret" } } }"#, cx);
+        assert!(has_delegate(cx));
+
+        set_user_settings(
+            r#"{ "fork": { "edit_prediction_provider": "none", "windsurf": { "api_key": "secret" } } }"#,
+            cx,
+        );
+        assert!(!has_delegate(cx));
+
+        set_user_settings(r#"{ "fork": { "windsurf": { "api_key": "secret" } } }"#, cx);
+        assert!(has_delegate(cx));
+
+        set_user_settings(
+            r#"{ "fork": { "windsurf": { "api_key": "secret", "enabled": false } } }"#,
+            cx,
+        );
+        assert!(!has_delegate(cx));
+
+        set_user_settings(r#"{ "fork": { "windsurf": { "api_key": "secret" } } }"#, cx);
+        window
+            .update(cx, |editor, window, cx| {
+                assert!(assign_edit_prediction_provider(
+                    editor,
+                    EditPredictionRequestTrigger::EditorCreated,
+                    window,
+                    cx
+                ));
+            })
+            .expect("window should be open");
+        assert!(has_delegate(cx));
     }
 
     #[gpui::test]

@@ -1,0 +1,12 @@
+# Messages used by GetUserJwt and GetTab (stage 4); GetChatMessage and ProvideFeedback are kept for stage 5.
+root .exa.auth_pb.GetUserJwtRequest
+root .exa.auth_pb.GetUserJwtResponse
+root .exa.api_server_pb.GetTabRequest
+root .exa.api_server_pb.GetTabResponse
+root .exa.api_server_pb.GetChatMessageRequest
+root .exa.api_server_pb.GetChatMessageResponse
+root .exa.api_server_pb.ProvideFeedbackRequest
+root .exa.api_server_pb.ProvideFeedbackResponse
+keep .exa.cortex_pb.CortexTrajectoryStep type status metadata code_action view_file view_code_item clipboard supercomplete_active_doc supercomplete_feedback read_terminal
+keep .exa.cortex_pb.CortexTrajectory trajectory_id cascade_id trajectory_type steps parent_references source metadata
+keep .exa.prompt_pb.UnifiedPromptComponents cortex_trajectory command_intent_info chat_messages code_diagnostics other_documents supercomplete_feedback_context

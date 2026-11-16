@@ -14,21 +14,55 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+async-compression.workspace = true
+base64.workspace = true
+collections.workspace = true
+edit_prediction_types.workspace = true
 editor.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
+http_client.workspace = true
 language.workspace = true
 log.workspace = true
+lsp.workspace = true
+parking_lot.workspace = true
 paths.workspace = true
+project.workspace = true
+prost.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+sha2.workspace = true
+similar.workspace = true
 sqlez.workspace = true
 tempfile.workspace = true
+ui.workspace = true
+url.workspace = true
 util.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 workspace.workspace = true
 
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
 [dev-dependencies]
+assets.workspace = true
+db = { workspace = true, features = ["test-support"] }
+editor = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+paths.workspace = true
+pretty_assertions.workspace = true
+project = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
+reqwest_client.workspace = true
+semver.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+theme = { workspace = true, features = ["test-support"] }
+theme_settings.workspace = true
+util = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }

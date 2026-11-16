@@ -23,6 +23,13 @@ settings.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+assets.workspace = true
+db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
+semver.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+theme = { workspace = true, features = ["test-support"] }
+theme_settings.workspace = true
