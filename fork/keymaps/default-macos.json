@@ -10,5 +10,11 @@
     "bindings": {
       "ctrl-\\ ctrl-\\": "copy_anchor::ToggleContextMode"
     }
+  },
+  {
+    "context": "Editor && json_explorer_enabled && json_explorer_convertible",
+    "bindings": {
+      "cmd-;": "json_explorer::ToggleCurrentDocument"
+    }
   }
 ]

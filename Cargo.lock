@@ -6559,9 +6559,21 @@ dependencies = [
 name = "fork_json_explorer"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "assets",
+ "clock",
+ "collections",
  "editor",
  "gpui",
+ "language",
+ "log",
+ "multi_buffer",
+ "release_channel",
+ "semver",
  "settings",
+ "theme",
+ "theme_settings",
+ "ui",
  "workspace",
 ]
 

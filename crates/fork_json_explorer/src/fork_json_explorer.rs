@@ -1,7 +1,17 @@
+mod attach;
+mod convert;
 pub mod core;
+mod paste;
+mod state;
+mod status;
+
+#[cfg(test)]
+mod tests;
+
+pub use convert::ToggleCurrentDocument;
 
 use editor::Editor;
-use gpui::{App, Context, Window};
+use gpui::{App, AppContext as _, Context, Window};
 use settings::{RegisterSetting, Settings, SettingsContent};
 use workspace::Workspace;
 
@@ -32,13 +42,20 @@ impl Settings for JsonExplorerSettings {
     }
 }
 
-pub fn init(_cx: &mut App) {}
+pub fn init(cx: &mut App) {
+    state::ConvertState::global(cx);
+}
 
-pub fn attach_editor(_editor: &mut Editor, _window: &mut Window, _cx: &mut Context<Editor>) {}
+pub fn attach_editor(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    attach::attach(editor, window, cx);
+}
 
-pub fn status_items(
-    _workspace: &mut Workspace,
-    _window: &mut Window,
-    _cx: &mut Context<Workspace>,
-) {
+pub fn status_items(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let status_bar = workspace.status_bar().clone();
+    cx.defer_in(window, move |_, window, cx| {
+        let hint_item = cx.new(status::ConvertHintItem::new);
+        status_bar.update(cx, |status_bar, cx| {
+            status_bar.add_left_item(hint_item, window, cx);
+        });
+    });
 }
