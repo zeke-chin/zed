@@ -1154,12 +1154,26 @@ fn parse_file_link(link: &str) -> Option<(PathBuf, Option<String>)> {
     Some((path, fragment))
 }
 
+// FORK: global slot for fork features to handle their `zed-fork://` links (fork/HOOKS.md H7)
+pub struct ForkHoverLinkHandler(pub fn(&str, &mut Window, &mut App) -> bool);
+impl gpui::Global for ForkHoverLinkHandler {}
+
 pub fn open_markdown_url(
     workspace: Option<Entity<Workspace>>,
     link: SharedString,
     window: &mut Window,
     cx: &mut App,
 ) {
+    // FORK: let the registered fork handler take `zed-fork://` links first
+    if link.starts_with("zed-fork://")
+        && let Some(handler) = cx
+            .try_global::<ForkHoverLinkHandler>()
+            .map(|handler| handler.0)
+        && handler(&link, window, cx)
+    {
+        return;
+    }
+
     if let Some((path, fragment)) = parse_file_link(&link)
         && let Some(workspace) = workspace
     {
