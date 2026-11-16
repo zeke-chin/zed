@@ -1,3 +1,5 @@
+pub mod core;
+
 use editor::Editor;
 use gpui::{App, Context, Window};
 use settings::{RegisterSetting, Settings, SettingsContent};
