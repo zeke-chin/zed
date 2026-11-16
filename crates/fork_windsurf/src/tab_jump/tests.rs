@@ -183,10 +183,36 @@ impl FakeServer {
             .body(AsyncBody::from(frames.concat()))?)
     }
 
+    /// `GetTab` requests sent for triggers (predictive requests, which set
+    /// `input_document.cursor_position`, aren't counted) and `GetChatMessage`
+    /// requests.
     fn counts(&self) -> (usize, usize) {
         let state = self.0.lock();
-        (state.tab_requests.len(), state.chat_requests.len())
+        let trigger_requests = state
+            .tab_requests
+            .iter()
+            .filter(|request| !is_predictive(request))
+            .count();
+        (trigger_requests, state.chat_requests.len())
     }
+
+    fn predictive_count(&self) -> usize {
+        let state = self.0.lock();
+        state
+            .tab_requests
+            .iter()
+            .filter(|request| is_predictive(request))
+            .count()
+    }
+}
+
+fn is_predictive(request: &GetTabRequest) -> bool {
+    request
+        .unified_prompt_components
+        .as_ref()
+        .and_then(|components| components.command_intent_info.as_ref())
+        .and_then(|intent| intent.input_document.as_ref())
+        .is_some_and(|document| document.cursor_position.is_some())
 }
 
 fn completion(target: &str, replacement: &str) -> String {
@@ -427,6 +453,8 @@ async fn test_get_tab_prediction_takes_precedence(cx: &mut TestAppContext) {
     let cursor = append(&fixture.shapes, "x = 1\n", cx);
     refresh(&fixture.delegate, &fixture.shapes, cursor, cx);
     assert_eq!(fixture.server.counts(), (1, 1));
+    // The prediction gets a predictive request; it doesn't send Tab Jump.
+    assert_eq!(fixture.server.predictive_count(), 1);
     let Some(Suggestion::Local(edits)) = suggest(&fixture.delegate, &fixture.shapes, cx) else {
         panic!("expected the GetTab prediction");
     };
@@ -508,5 +536,52 @@ async fn test_disabled_tab_jump_sends_no_chat_request(cx: &mut TestAppContext) {
     assert_eq!(
         cx.update(|cx| crate::tab_jump::last_summary(cx)),
         serde_json::Value::Null
+    );
+}
+
+#[gpui::test]
+async fn test_predictive_hit_without_edits_still_asks_tab_jump(cx: &mut TestAppContext) {
+    let fixture = setup(cx).await;
+    fixture.server.0.lock().completion = completion(
+        "def area(<|cursor|>width, height):",
+        "def area(width, height, depth):",
+    );
+    fixture.server.0.lock().tab_rewrite = Some((
+        "print(area(2, 3))".to_string(),
+        "print(area(4, 5))".to_string(),
+    ));
+    let cursor = append(&fixture.shapes, "x = 1\n", cx);
+    refresh(&fixture.delegate, &fixture.shapes, cursor, cx);
+    assert_eq!(fixture.server.counts(), (1, 1));
+    assert_eq!(fixture.server.predictive_count(), 1);
+
+    // Accept: the buffer now reads as the predictive request assumed, and
+    // that request predicted nothing more (the rewrite no longer applies).
+    let buffer = fixture.shapes.clone();
+    fixture.delegate.update(cx, |delegate, cx| {
+        let start = buffer.read(cx).anchor_before(0);
+        let Some(EditPrediction::Local { edits, .. }) = delegate.suggest(&buffer, start, cx) else {
+            panic!("expected the GetTab prediction");
+        };
+        buffer.update(cx, |buffer, cx| buffer.edit(edits, None, cx));
+        delegate.accept(cx);
+        delegate.refresh(
+            buffer.clone(),
+            start,
+            Duration::ZERO,
+            EditPredictionRequestTrigger::PredictionAccepted,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // No new GetTab for the trigger, but Tab Jump is asked where to go next.
+    assert_eq!(fixture.server.counts(), (1, 2));
+    let Some(Suggestion::Local(edits)) = suggest(&fixture.delegate, &fixture.shapes, cx) else {
+        panic!("expected the Tab Jump edits");
+    };
+    assert_eq!(
+        edits,
+        vec![(Point::new(0, 22), Point::new(0, 22), ", depth".to_string())]
     );
 }

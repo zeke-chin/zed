@@ -197,7 +197,9 @@ pub(crate) fn last_request_text(cx: &App) -> String {
         .as_millis() as u64;
     let summary = serde_json::json!({
         "sent_at_unix_ms": sent_at,
-        "trajectory_steps": windsurf.trajectory().steps().len(),
+        "trajectory_steps": windsurf.trajectory().len(),
+        "cached_trajectory_hashes": windsurf.cached_hash_count(),
+        "stats": windsurf.stats().to_json(),
         "response": last_request.response,
         "request": last_request.request,
         "tab_jump": crate::tab_jump::last_summary(cx),

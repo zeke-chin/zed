@@ -12,6 +12,7 @@ use crate::{
         api_server_pb::{GetChatMessageRequest, GetTabRequest},
         codeium_common_pb::{CodeDiagnostic, Language},
         cortex_pb::CortexTrajectoryStep,
+        prompt_pb::SupercompleteFeedback,
     },
 };
 
@@ -30,6 +31,9 @@ pub struct DocumentContext {
     pub selection_start_line: u32,
     pub selection_end_line: u32,
     pub is_dirty: bool,
+    /// Row and column (in characters) of the cursor. Only set for predictive
+    /// requests, like the official language server does.
+    pub cursor_position: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +43,13 @@ pub struct TabRequestInput {
     pub steps: Vec<CortexTrajectoryStep>,
     /// The session's `USER_MAINLINE` trajectory id; the server keys its cache on it.
     pub mainline_trajectory_id: String,
+    /// Server hashes of `steps[..cached_hashes.len()]` from an earlier
+    /// response. When not empty, only the steps after them are sent.
+    pub cached_hashes: Vec<u64>,
+    /// `supercomplete_feedback_context.feedback`.
+    pub feedback: Vec<SupercompleteFeedback>,
+    /// `metadata.trigger_id`; a predictive request reuses its trigger's id.
+    pub trigger_id: String,
 }
 
 pub struct TabExchange {
@@ -48,6 +59,23 @@ pub struct TabExchange {
     pub result: Result<TabStream, ConnectError>,
     pub elapsed: Duration,
     pub first_delta_after: Option<Duration>,
+    /// Encoded size of the request that produced `result`.
+    pub request_bytes: usize,
+    /// The server had lost the trajectory cache and the full trajectory was sent again.
+    pub resent_full_trajectory: bool,
+}
+
+/// What `ProvideFeedback` reports about a shown prediction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedbackReport {
+    pub prompt_id: String,
+    pub completion_id: String,
+    pub accepted: bool,
+    /// The prediction came from a predictive request rather than the
+    /// request of the trigger that showed it.
+    pub from_cache: bool,
+    pub feedback_delay_ms: i64,
+    pub timestamp_unix_ms: i64,
 }
 
 pub trait TabBackend: Send + Sync {
@@ -72,4 +100,10 @@ pub trait TabBackend: Send + Sync {
 
     /// Drops cached tokens, e.g. after the API key changed.
     fn forget_credentials(&self) -> BoxFuture<'static, ()>;
+
+    fn provide_feedback(
+        &self,
+        api_key: String,
+        report: FeedbackReport,
+    ) -> BoxFuture<'static, Result<(), ConnectError>>;
 }

@@ -1,9 +1,18 @@
-//! The user's edit history, sent as `CORTEX_STEP_TYPE_CODE_ACTION` steps. Edits
-//! made between two requests are merged into one step per buffer, which is how
-//! the official language server splits continuous typing (`fork/spike/结论.md`
-//! 问题 9).
+//! The user's activity, sent as trajectory steps: `CODE_ACTION` for edits,
+//! `SUPERCOMPLETE_FEEDBACK` after a prediction is accepted or rejected and
+//! `CLIPBOARD` after a copy (`fork/spike/结论.md` 问题 9).
+//!
+//! Edits made to a buffer are merged into one step until something splits
+//! them: a request (a trigger), or an IDE action such as accepting or rejecting
+//! a prediction or copying text. Committed steps never change afterwards, so
+//! the server's hashes for them stay valid.
+//!
+//! Retention: at most [`MAX_STEPS`] steps and nothing older than [`MAX_AGE`].
+//! Dropping steps from the front invalidates every cached hash, so steps are
+//! dropped in batches (down to [`TRIMMED_STEPS`], or everything older than
+//! [`TRIMMED_AGE`]) to keep full resends rare.
 
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use collections::{HashMap, HashSet};
 use gpui::{App, Entity, EntityId, WeakEntity};
@@ -26,18 +35,24 @@ use crate::{
 
 /// Unchanged lines kept around an edit in its diff.
 const CONTEXT_LINES: usize = 10;
-/// The official client didn't trim within a 70 second session; this keeps a
-/// long session's request size bounded until stage 5 picks a policy.
-const MAX_STEPS: usize = 64;
+pub const MAX_STEPS: usize = 50;
+pub const TRIMMED_STEPS: usize = 40;
+pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
+pub const TRIMMED_AGE: Duration = Duration::from_secs(8 * 60);
 
 struct TrackedBuffer {
     buffer: WeakEntity<Buffer>,
     baseline: BufferSnapshot,
 }
 
+struct Entry {
+    step: CortexTrajectoryStep,
+    recorded_at: Instant,
+}
+
 pub struct Trajectory {
     mainline_id: String,
-    steps: Vec<CortexTrajectoryStep>,
+    entries: Vec<Entry>,
     buffers: HashMap<EntityId, TrackedBuffer>,
     uris_with_original_content: HashSet<String>,
 }
@@ -46,7 +61,7 @@ impl Default for Trajectory {
     fn default() -> Self {
         Self {
             mainline_id: uuid::Uuid::new_v4().to_string(),
-            steps: Vec::new(),
+            entries: Vec::new(),
             buffers: HashMap::default(),
             uris_with_original_content: HashSet::default(),
         }
@@ -58,8 +73,19 @@ impl Trajectory {
         &self.mainline_id
     }
 
-    pub fn steps(&self) -> &[CortexTrajectoryStep] {
-        &self.steps
+    pub fn steps(&self) -> Vec<CortexTrajectoryStep> {
+        self.entries
+            .iter()
+            .map(|entry| entry.step.clone())
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Starts recording edits to `buffer`, using its current text as the
@@ -108,24 +134,115 @@ impl Trajectory {
             self.buffers.remove(&entity_id);
         }
         for (uri, baseline, current) in pending {
-            let old_text = baseline.text();
-            let new_text = current.text();
-            let original_content =
-                (!self.uris_with_original_content.contains(&uri)).then(|| old_text.clone());
-            if let Some(step) = edit_step(
-                &uri,
-                &old_text,
-                &new_text,
-                original_content,
-                SystemTime::now(),
-            ) {
-                self.uris_with_original_content.insert(uri);
-                self.steps.push(step);
-            }
+            self.push_edit(&uri, &baseline.text(), &current.text(), cx);
         }
-        if self.steps.len() > MAX_STEPS {
-            self.steps.drain(..self.steps.len() - MAX_STEPS);
+        self.prune(cx);
+    }
+
+    /// Commits the edits made to `buffer` up to `snapshot`, an earlier state
+    /// of the buffer. Used to split the user's typing from an accepted
+    /// prediction that was applied after `snapshot`.
+    pub fn commit_buffer_at(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        snapshot: &BufferSnapshot,
+        cx: &App,
+    ) {
+        let Some(tracked) = self.buffers.get_mut(&buffer.entity_id()) else {
+            return;
+        };
+        if !snapshot.version().changed_since(tracked.baseline.version()) {
+            return;
         }
+        let baseline = std::mem::replace(&mut tracked.baseline, snapshot.clone());
+        if let Some(location) = buffer_location(buffer.read(cx), cx) {
+            self.push_edit(&location.uri(), &baseline.text(), &snapshot.text(), cx);
+        }
+        self.prune(cx);
+    }
+
+    /// The step that accepting a prediction would add: the edits not yet
+    /// committed plus the prediction, i.e. the buffer's baseline →
+    /// `assumed_text`. Doesn't change the trajectory.
+    pub fn assumed_step(
+        &self,
+        buffer: &Entity<Buffer>,
+        assumed_text: &str,
+        cx: &App,
+    ) -> Option<CortexTrajectoryStep> {
+        let tracked = self.buffers.get(&buffer.entity_id())?;
+        let location = buffer_location(buffer.read(cx), cx)?;
+        let uri = location.uri();
+        let old_text = tracked.baseline.text();
+        let original_content =
+            (!self.uris_with_original_content.contains(&uri)).then(|| old_text.clone());
+        edit_step(
+            &uri,
+            &old_text,
+            assumed_text,
+            original_content,
+            SystemTime::now(),
+        )
+    }
+
+    /// Appends a step that isn't an edit (feedback, clipboard).
+    pub fn push(&mut self, step: CortexTrajectoryStep, cx: &App) {
+        self.insert(self.entries.len(), step, cx);
+    }
+
+    /// Inserts a step at `index`, clamped to the end.
+    pub fn insert(&mut self, index: usize, step: CortexTrajectoryStep, cx: &App) {
+        let index = index.min(self.entries.len());
+        self.entries.insert(
+            index,
+            Entry {
+                step,
+                recorded_at: cx.background_executor().now(),
+            },
+        );
+        self.prune(cx);
+    }
+
+    fn push_edit(&mut self, uri: &str, old_text: &str, new_text: &str, cx: &App) {
+        let original_content =
+            (!self.uris_with_original_content.contains(uri)).then(|| old_text.to_string());
+        if let Some(step) = edit_step(uri, old_text, new_text, original_content, SystemTime::now())
+        {
+            self.uris_with_original_content.insert(uri.to_string());
+            self.entries.push(Entry {
+                step,
+                recorded_at: cx.background_executor().now(),
+            });
+        }
+    }
+
+    fn prune(&mut self, cx: &App) {
+        let now = cx.background_executor().now();
+        prune_entries(&mut self.entries, now, |entry| entry.recorded_at);
+    }
+}
+
+/// Applies the retention policy described in the module documentation.
+fn prune_entries<T>(entries: &mut Vec<T>, now: Instant, recorded_at: impl Fn(&T) -> Instant) {
+    let expired =
+        |entry: &T, age: Duration| now.saturating_duration_since(recorded_at(entry)) > age;
+    if entries.first().is_some_and(|entry| expired(entry, MAX_AGE)) {
+        let keep_from = entries
+            .iter()
+            .position(|entry| !expired(entry, TRIMMED_AGE))
+            .unwrap_or(entries.len());
+        entries.drain(..keep_from);
+    }
+    if entries.len() > MAX_STEPS {
+        entries.drain(..entries.len() - TRIMMED_STEPS);
+    }
+}
+
+pub fn step_metadata(created_at: SystemTime) -> CortexStepMetadata {
+    CortexStepMetadata {
+        created_at: Some(timestamp(created_at)),
+        source: CortexStepSource::UserExplicit as i32,
+        ..Default::default()
     }
 }
 
@@ -185,11 +302,7 @@ pub fn edit_step(
     Some(CortexTrajectoryStep {
         r#type: CortexStepType::CodeAction as i32,
         status: CortexStepStatus::Done as i32,
-        metadata: Some(CortexStepMetadata {
-            created_at: Some(timestamp(created_at)),
-            source: CortexStepSource::UserExplicit as i32,
-            ..Default::default()
-        }),
+        metadata: Some(step_metadata(created_at)),
         step: Some(cortex_trajectory_step::Step::CodeAction(
             CortexStepCodeAction {
                 action_spec: Some(ActionSpec {
@@ -303,5 +416,33 @@ mod tests {
         assert_eq!(lines, vec!["+x", " a", " b", "+y"]);
         assert_eq!(original, "");
         assert!(edit_step("file:///a.py", "same", "same", None, SystemTime::now()).is_none());
+    }
+
+    #[test]
+    fn test_retention_drops_steps_in_batches() {
+        let start = Instant::now();
+        let mut entries: Vec<Instant> = (0..MAX_STEPS).map(|_| start).collect();
+        prune_entries(&mut entries, start, |entry| *entry);
+        assert_eq!(entries.len(), MAX_STEPS);
+        entries.push(start);
+        prune_entries(&mut entries, start, |entry| *entry);
+        assert_eq!(entries.len(), TRIMMED_STEPS);
+
+        // Ages: 11, 9, 7 and 1 minutes. Once the oldest is past ten minutes,
+        // everything older than eight minutes goes.
+        let now = start + Duration::from_secs(20 * 60);
+        let minutes_ago = |minutes: u64| now - Duration::from_secs(minutes * 60);
+        let mut entries = vec![
+            minutes_ago(11),
+            minutes_ago(9),
+            minutes_ago(7),
+            minutes_ago(1),
+        ];
+        prune_entries(&mut entries, now, |entry| *entry);
+        assert_eq!(entries, vec![minutes_ago(7), minutes_ago(1)]);
+        // Nothing is past ten minutes: nothing goes, even past eight.
+        let mut entries = vec![minutes_ago(9), minutes_ago(1)];
+        prune_entries(&mut entries, now, |entry| *entry);
+        assert_eq!(entries.len(), 2);
     }
 }

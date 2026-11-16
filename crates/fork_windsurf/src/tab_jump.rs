@@ -159,7 +159,7 @@ fn collect(
     );
     let cursor_offset = cursor.to_offset(&snapshot);
 
-    let history = prompt::history_from_steps(windsurf.trajectory().steps());
+    let history = prompt::history_from_steps(&windsurf.trajectory().steps());
     let edited_paths: Vec<&str> = history
         .iter()
         .filter_map(|event| match event {
@@ -417,6 +417,8 @@ async fn interpret(
             edits,
             edit_preview,
             jump,
+            record: None,
+            shown_at: None,
         },
         target,
     ))

@@ -110,15 +110,35 @@ pub fn document_context(
     location: &BufferLocation,
     is_dirty: bool,
 ) -> DocumentSnapshot {
-    let text = snapshot.text();
-    let cursor_offset = cursor.to_offset(snapshot);
-    let cursor_row = snapshot.offset_to_point(cursor_offset).row;
-    let window = selection_window(&text, cursor_row);
-    let (language, editor_language) = language_for(
+    document_context_for_text(
+        snapshot.text(),
+        cursor.to_offset(snapshot),
         snapshot
             .language()
             .map(|language| language.name().0.to_string()),
-    );
+        location,
+        is_dirty,
+        None,
+    )
+}
+
+/// The document context for `text`, which needn't be the buffer's current
+/// text: predictive requests describe the buffer as if a prediction had been
+/// accepted.
+pub fn document_context_for_text(
+    text: String,
+    cursor_offset: usize,
+    zed_language: Option<String>,
+    location: &BufferLocation,
+    is_dirty: bool,
+    cursor_position: Option<(u32, u32)>,
+) -> DocumentSnapshot {
+    let cursor_row = text
+        .get(..cursor_offset)
+        .map(|before| before.matches('\n').count() as u32)
+        .unwrap_or_default();
+    let window = selection_window(&text, cursor_row);
+    let (language, editor_language) = language_for(zed_language);
     DocumentSnapshot {
         document: DocumentContext {
             text,
@@ -131,17 +151,21 @@ pub fn document_context(
             selection_start_line: window.start_line,
             selection_end_line: window.end_line,
             is_dirty,
+            cursor_position,
         },
         window,
     }
 }
 
-/// Diagnostics within ten rows of the cursor, errors first, at most five.
+/// Diagnostics within ten rows of the cursor, at most five, of any severity
+/// (`SUPERCOMPLETE_CODE_DIAGNOSTICS_TOP_K=5`, threshold `all_diagnostics`;
+/// `fork/spike/结论.md` 问题 7). Errors come first, then the closest to the
+/// cursor. The fields are the ones the official client fills: a range with
+/// UTF-16 positions only, message, severity, source and uri.
 pub fn diagnostics_near(
     snapshot: &BufferSnapshot,
     cursor_row: u32,
     uri: &str,
-    language: Language,
 ) -> Vec<CodeDiagnostic> {
     let max_point = snapshot.max_point();
     let start = Point::new(cursor_row.saturating_sub(DIAGNOSTIC_RADIUS), 0);
@@ -173,16 +197,14 @@ pub fn diagnostics_near(
             };
             CodeDiagnostic {
                 range: Some(Span {
-                    start_offset: range.start as u64,
-                    end_offset: range.end as u64,
                     start_position: Some(position(range.start)),
                     end_position: Some(position(range.end)),
+                    ..Default::default()
                 }),
                 message: diagnostic.message.as_str().to_string(),
                 severity: severity_name(severity).to_string(),
                 source: diagnostic.source.clone().unwrap_or_default(),
                 uri: uri.to_string(),
-                language: language as i32,
                 ..Default::default()
             }
         })
@@ -393,8 +415,7 @@ mod tests {
             buffer.update_diagnostics(LanguageServerId(0), set, cx);
         });
         buffer.read_with(cx, |buffer, _| {
-            let diagnostics =
-                diagnostics_near(&buffer.snapshot(), 20, "file:///a.txt", Language::Plaintext);
+            let diagnostics = diagnostics_near(&buffer.snapshot(), 20, "file:///a.txt");
             let messages: Vec<_> = diagnostics
                 .iter()
                 .map(|diagnostic| diagnostic.message.as_str())
@@ -415,6 +436,8 @@ mod tests {
                 range.start_position,
                 Some(DocumentPosition { row: 24, col: 0 })
             );
+            assert_eq!((range.start_offset, range.end_offset), (0, 0));
+            assert_eq!(diagnostics[0].language, 0);
         });
     }
 }

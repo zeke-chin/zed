@@ -1,20 +1,37 @@
 //! The `EditPredictionDelegate` that shows Windsurf's next-edit predictions.
+//!
+//! A trigger is answered, in order of preference, by:
+//! 1. the shown prediction, trimmed locally while the user types along it
+//!    (`edit_prediction_types::interpolate_edits`, no request);
+//! 2. a predictive request made right after the previous prediction, when the
+//!    buffer now reads exactly as if that prediction had been accepted
+//!    (`prefetch.rs`, no new request);
+//! 3. a `GetTab` request after a short debounce.
 
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{
+    ops::Range,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use edit_prediction_types::{
     EditPrediction, EditPredictionDelegate, EditPredictionDiscardReason, EditPredictionIconSet,
-    EditPredictionRequestTrigger, PredictedCursorPosition,
+    EditPredictionRequestTrigger, PredictedCursorPosition, SuggestionDisplayType,
 };
-use gpui::{App, AppContext as _, Context, Entity, SharedString, Task, WeakEntity};
+use gpui::{
+    App, AppContext as _, AsyncApp, Context, Entity, EntityId, SharedString, Task, WeakEntity,
+};
 use language::{Anchor, Buffer, BufferSnapshot, EditPreview, ToOffset as _};
 use project::Project;
 use ui::IconName;
 
 use crate::{
     Preparation, PreparedRequest, RequestOutcome, Windsurf, WindsurfSettings,
+    context::SelectionWindow,
     diff::{PredictionError, prediction_edits},
+    feedback::{DocumentInfo, PredictionRecord, row_and_column},
     native::get_tab::TabStream,
+    prefetch::{Prefetch, PrefetchUse, apply_edits},
     tab_jump::{self, JumpOrigin},
 };
 use settings::Settings as _;
@@ -22,16 +39,22 @@ use settings::Settings as _;
 /// Typing in quick succession only sends a request once it pauses this long.
 pub const DEBOUNCE: Duration = Duration::from_millis(100);
 
+pub(crate) type PredictionEdits = Arc<[(Range<Anchor>, Arc<str>)]>;
+
 #[derive(Clone)]
 pub(crate) struct CurrentPrediction {
     pub id: SharedString,
     pub buffer: Entity<Buffer>,
     pub snapshot: BufferSnapshot,
-    pub edits: Arc<[(Range<Anchor>, Arc<str>)]>,
+    pub edits: PredictionEdits,
     pub edit_preview: EditPreview,
     /// Set when the edits are in another file than the one they were
     /// predicted for (Tab Jump).
     pub jump: Option<JumpOrigin>,
+    /// For feedback; `None` for Tab Jump predictions, which have no `GetTab`
+    /// window to report.
+    pub record: Option<PredictionRecord>,
+    pub shown_at: Option<Instant>,
 }
 
 impl CurrentPrediction {
@@ -41,11 +64,26 @@ impl CurrentPrediction {
     }
 }
 
+/// A `GetTab` response that is ready to be shown.
+pub(crate) struct ResponseForBuffer {
+    pub stream: TabStream,
+    pub window: SelectionWindow,
+    pub abs_path: String,
+    pub prompt_id: String,
+    pub document: DocumentInfo,
+    pub from_cache: bool,
+}
+
 pub struct WindsurfDelegate {
-    windsurf: Entity<Windsurf>,
-    pending_request: Option<(u64, Task<()>)>,
-    current: Option<CurrentPrediction>,
-    project: Option<WeakEntity<Project>>,
+    pub(crate) windsurf: Entity<Windsurf>,
+    pub(crate) pending_request: Option<(u64, Task<()>)>,
+    pub(crate) current: Option<CurrentPrediction>,
+    /// The buffer as of the last `suggest`, which is the state just before
+    /// an accepted prediction gets applied.
+    last_suggested: Option<(EntityId, BufferSnapshot)>,
+    pub(crate) prefetch: Option<Prefetch>,
+    pub(crate) next_prefetch_generation: u64,
+    pub(crate) project: Option<WeakEntity<Project>>,
 }
 
 impl WindsurfDelegate {
@@ -56,6 +94,9 @@ impl WindsurfDelegate {
             windsurf,
             pending_request: None,
             current: None,
+            last_suggested: None,
+            prefetch: None,
+            next_prefetch_generation: 0,
             project: None,
         }
     }
@@ -72,11 +113,36 @@ impl WindsurfDelegate {
         }
     }
 
-    fn cancel_pending_request(&mut self, cx: &mut App) {
+    pub(crate) fn cancel_pending_request(&mut self, cx: &mut App) {
         if let Some((request_id, _task)) = self.pending_request.take() {
             self.windsurf
                 .update(cx, |windsurf, cx| windsurf.cancel_request(request_id, cx));
         }
+    }
+
+    /// Sends a `GetTab` request for the cursor after `debounce`.
+    pub(crate) fn start_request(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cursor: Anchor,
+        debounce: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_pending_request(cx);
+        self.windsurf
+            .update(cx, |windsurf, cx| windsurf.track_buffer(&buffer, cx));
+        let request_id = self
+            .windsurf
+            .update(cx, |windsurf, _| windsurf.next_request_id());
+        let windsurf = self.windsurf.clone();
+        let task = cx.spawn(async move |this, cx| {
+            if let Err(error) =
+                Self::run_request(this, windsurf, buffer, cursor, request_id, debounce, cx).await
+            {
+                log::debug!("windsurf: request {request_id} ended early: {error:#}");
+            }
+        });
+        self.pending_request = Some((request_id, task));
     }
 
     async fn run_request(
@@ -86,17 +152,18 @@ impl WindsurfDelegate {
         cursor: Anchor,
         request_id: u64,
         debounce: Duration,
-        cx: &mut gpui::AsyncApp,
+        cx: &mut AsyncApp,
     ) -> anyhow::Result<()> {
         if !debounce.is_zero() {
             cx.background_executor().timer(debounce).await;
         }
+        let trigger_id = uuid::Uuid::new_v4().to_string();
         loop {
             let preparation = windsurf.update(cx, |windsurf, cx| {
-                windsurf.prepare_request(request_id, &buffer, cursor, cx)
+                windsurf.prepare_request(request_id, &buffer, cursor, &trigger_id, cx)
             });
-            let prepared = match preparation {
-                Preparation::Send(prepared) => prepared,
+            let (prepared, snapshot) = match preparation {
+                Preparation::Send(prepared, snapshot) => (prepared, snapshot),
                 Preparation::WaitUntil(retry_at) => {
                     wait_until(retry_at, cx).await;
                     continue;
@@ -110,9 +177,9 @@ impl WindsurfDelegate {
                 backend,
                 api_key,
                 input,
-                snapshot,
                 window,
                 abs_path,
+                details,
             } = prepared;
             let project = this.read_with(cx, |this, _| this.project.clone())?;
             let tab_jump = tab_jump::start(
@@ -129,51 +196,29 @@ impl WindsurfDelegate {
 
             let retry_at = match &exchange.result {
                 Ok(stream) => {
-                    let conversion = cx
-                        .background_spawn({
-                            let snapshot = snapshot.clone();
-                            let stream = stream.clone();
-                            let window = window.byte_range.clone();
-                            async move { convert(&snapshot, window, &stream, &abs_path) }
-                        })
-                        .await;
-                    let prediction = match conversion {
-                        Ok(edits) if !edits.is_empty() => {
-                            let still_valid = buffer.read_with(cx, |buffer, _| {
-                                window_unchanged(&snapshot, &buffer.snapshot(), &window)
-                            });
-                            if still_valid {
-                                let edits: Arc<[(Range<Anchor>, Arc<str>)]> = edits
-                                    .into_iter()
-                                    .map(|(range, text)| {
-                                        (
-                                            snapshot.anchor_after(range.start)
-                                                ..snapshot.anchor_before(range.end),
-                                            Arc::from(text),
-                                        )
-                                    })
-                                    .collect();
-                                let edit_preview = buffer
-                                    .read_with(cx, |buffer, cx| {
-                                        buffer.preview_edits(edits.clone(), cx)
-                                    })
-                                    .await;
-                                Ok(Some((edits, edit_preview)))
-                            } else {
-                                Err("the buffer changed while the request was in flight")
-                            }
-                        }
-                        Ok(_) => Ok(None),
-                        Err(reason) => Err(reason),
-                    };
+                    let prediction =
+                        prepare_prediction(&buffer, &snapshot, &window, stream, &abs_path, cx)
+                            .await;
                     let outcome = match &prediction {
                         Ok(Some((edits, _))) => RequestOutcome::Predicted(edits.len()),
                         Ok(None) => RequestOutcome::NoPrediction,
                         Err(reason) => RequestOutcome::Discarded(reason),
                     };
                     windsurf.update(cx, |windsurf, cx| {
-                        windsurf.finish_request(request_id, &exchange, outcome, cx)
+                        windsurf.finish_request(request_id, &details, &exchange, outcome, cx)
                     });
+                    let response = ResponseForBuffer {
+                        stream: stream.clone(),
+                        window,
+                        abs_path,
+                        prompt_id: exchange
+                            .request
+                            .as_ref()
+                            .map(|request| request.prompt_id.clone())
+                            .unwrap_or_default(),
+                        document: details.document.clone(),
+                        from_cache: false,
+                    };
                     let jump = match (&prediction, tab_jump) {
                         (Ok(None), Some(tab_jump)) => tab_jump.await,
                         (_, Some(tab_jump)) => {
@@ -185,14 +230,16 @@ impl WindsurfDelegate {
                     this.update(cx, |this, cx| {
                         this.finish_pending(request_id);
                         if let Ok(Some((edits, edit_preview))) = prediction {
-                            this.current = Some(CurrentPrediction {
-                                id: SharedString::from(format!("windsurf-{request_id}")),
-                                buffer: buffer.clone(),
+                            this.install(
+                                &buffer,
                                 snapshot,
                                 edits,
                                 edit_preview,
-                                jump: None,
-                            });
+                                response,
+                                request_id,
+                                &trigger_id,
+                                cx,
+                            );
                         } else if let Some(jump) = jump {
                             this.current = Some(jump);
                         }
@@ -201,7 +248,13 @@ impl WindsurfDelegate {
                     return Ok(());
                 }
                 Err(_) => windsurf.update(cx, |windsurf, cx| {
-                    windsurf.finish_request(request_id, &exchange, RequestOutcome::Failed, cx)
+                    windsurf.finish_request(
+                        request_id,
+                        &details,
+                        &exchange,
+                        RequestOutcome::Failed,
+                        cx,
+                    )
                 }),
             };
 
@@ -216,7 +269,54 @@ impl WindsurfDelegate {
         }
     }
 
-    fn finish_pending(&mut self, request_id: u64) {
+    /// Makes a converted response the shown prediction and starts the
+    /// predictive request for it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        snapshot: BufferSnapshot,
+        edits: PredictionEdits,
+        edit_preview: EditPreview,
+        response: ResponseForBuffer,
+        request_id: u64,
+        trigger_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let current_snapshot = buffer.read(cx).snapshot();
+        let assumed =
+            edit_prediction_types::interpolate_edits(&snapshot, &current_snapshot, &edits)
+                .filter(|edits| !edits.is_empty())
+                .map(|edits| apply_edits(&current_snapshot, &edits));
+        let cursor_position = assumed
+            .as_ref()
+            .map(|(text, cursor)| row_and_column(text, *cursor))
+            .unwrap_or_default();
+        let record = PredictionRecord::new(
+            response.prompt_id,
+            &response.document,
+            &response.window,
+            response.stream.old_text,
+            response.stream.new_text,
+            cursor_position,
+            response.from_cache,
+        );
+        self.current = Some(CurrentPrediction {
+            id: SharedString::from(format!("windsurf-{request_id}")),
+            buffer: buffer.clone(),
+            snapshot,
+            edits,
+            edit_preview,
+            jump: None,
+            record: Some(record),
+            shown_at: None,
+        });
+        if let Some((assumed_text, assumed_cursor)) = assumed {
+            self.start_prefetch(buffer, assumed_text, assumed_cursor, trigger_id, cx);
+        }
+    }
+
+    pub(crate) fn finish_pending(&mut self, request_id: u64) {
         if self
             .pending_request
             .as_ref()
@@ -225,13 +325,87 @@ impl WindsurfDelegate {
             self.pending_request = None;
         }
     }
+
+    fn record_feedback(
+        &mut self,
+        current: CurrentPrediction,
+        accepted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = current.record else {
+            return;
+        };
+        let now = cx.background_executor().now();
+        let delay = current
+            .shown_at
+            .map(|shown_at| now.saturating_duration_since(shown_at))
+            .unwrap_or_default();
+        let before_accept = self
+            .last_suggested
+            .take()
+            .filter(|(buffer_id, _)| *buffer_id == current.buffer.entity_id())
+            .map(|(_, snapshot)| snapshot);
+        self.windsurf.update(cx, |windsurf, cx| {
+            windsurf.record_feedback(
+                &current.buffer,
+                before_accept.as_ref(),
+                &record,
+                accepted,
+                delay,
+                cx,
+            )
+        });
+    }
 }
 
-async fn wait_until(instant: std::time::Instant, cx: &mut gpui::AsyncApp) {
+async fn wait_until(instant: Instant, cx: &mut AsyncApp) {
     let now = cx.background_executor().now();
     cx.background_executor()
         .timer(instant.saturating_duration_since(now))
         .await;
+}
+
+/// Converts a response into anchored edits and their preview. Fails when the
+/// window it rewrites changed since `snapshot` was taken.
+pub(crate) async fn prepare_prediction(
+    buffer: &Entity<Buffer>,
+    snapshot: &BufferSnapshot,
+    window: &SelectionWindow,
+    stream: &TabStream,
+    abs_path: &str,
+    cx: &mut AsyncApp,
+) -> Result<Option<(PredictionEdits, EditPreview)>, &'static str> {
+    let conversion = cx
+        .background_spawn({
+            let snapshot = snapshot.clone();
+            let stream = stream.clone();
+            let window = window.byte_range.clone();
+            let abs_path = abs_path.to_string();
+            async move { convert(&snapshot, window, &stream, &abs_path) }
+        })
+        .await?;
+    if conversion.is_empty() {
+        return Ok(None);
+    }
+    let still_valid = buffer.read_with(cx, |buffer, _| {
+        window_unchanged(snapshot, &buffer.snapshot(), window)
+    });
+    if !still_valid {
+        return Err("the buffer changed while the request was in flight");
+    }
+    let edits: PredictionEdits = conversion
+        .into_iter()
+        .map(|(range, text)| {
+            (
+                snapshot.anchor_after(range.start)..snapshot.anchor_before(range.end),
+                Arc::from(text),
+            )
+        })
+        .collect();
+    let edit_preview = buffer
+        .read_with(cx, |buffer, cx| buffer.preview_edits(edits.clone(), cx))
+        .await;
+    Ok(Some((edits, edit_preview)))
 }
 
 /// Checks that the window the prediction rewrites still has the text it had
@@ -239,7 +413,7 @@ async fn wait_until(instant: std::time::Instant, cx: &mut gpui::AsyncApp) {
 fn window_unchanged(
     request_snapshot: &BufferSnapshot,
     current: &BufferSnapshot,
-    window: &crate::context::SelectionWindow,
+    window: &SelectionWindow,
 ) -> bool {
     if current.version() == request_snapshot.version() {
         return true;
@@ -321,48 +495,46 @@ impl EditPredictionDelegate for WindsurfDelegate {
             && current.buffer == buffer
             && current.interpolate(&buffer.read(cx).snapshot()).is_some()
         {
+            self.windsurf
+                .update(cx, |windsurf, _| windsurf.count_local_cache_hit());
             return;
         }
-        self.cancel_pending_request(cx);
-        self.windsurf
-            .update(cx, |windsurf, cx| windsurf.track_buffer(&buffer, cx));
+        match self.use_prefetch(&buffer, cursor_position, cx) {
+            PrefetchUse::Used | PrefetchUse::Waiting => return,
+            PrefetchUse::Unavailable => self.prefetch = None,
+        }
 
         let debounce = if trigger == EditPredictionRequestTrigger::Explicit {
             debounce_duration
         } else {
             debounce_duration.max(DEBOUNCE)
         };
-        let request_id = self
-            .windsurf
-            .update(cx, |windsurf, _| windsurf.next_request_id());
-        let windsurf = self.windsurf.clone();
-        let task = cx.spawn(async move |this, cx| {
-            if let Err(error) = Self::run_request(
-                this,
-                windsurf,
-                buffer,
-                cursor_position,
-                request_id,
-                debounce,
-                cx,
-            )
-            .await
-            {
-                log::debug!("windsurf: request {request_id} ended early: {error:#}");
-            }
-        });
-        self.pending_request = Some((request_id, task));
+        self.start_request(buffer, cursor_position, debounce, cx);
     }
 
     fn accept(&mut self, cx: &mut Context<Self>) {
         self.cancel_pending_request(cx);
-        self.current = None;
+        if let Some(current) = self.current.take() {
+            self.record_feedback(current, true, cx);
+        }
     }
 
-    fn discard(&mut self, _reason: EditPredictionDiscardReason, cx: &mut Context<Self>) {
+    fn discard(&mut self, reason: EditPredictionDiscardReason, cx: &mut Context<Self>) {
         self.cancel_pending_request(cx);
         if let Some(current) = self.current.take() {
             tab_jump::clear_landing(&current.id, cx);
+            if reason == EditPredictionDiscardReason::Rejected {
+                self.prefetch = None;
+                self.record_feedback(current, false, cx);
+            }
+        }
+    }
+
+    fn did_show(&mut self, _display_type: SuggestionDisplayType, cx: &mut Context<Self>) {
+        if let Some(current) = &mut self.current
+            && current.shown_at.is_none()
+        {
+            current.shown_at = Some(cx.background_executor().now());
         }
     }
 
@@ -398,14 +570,17 @@ impl EditPredictionDelegate for WindsurfDelegate {
             self.current = None;
             return None;
         };
+        let id = current.id.clone();
+        let edit_preview = current.edit_preview.clone();
+        self.last_suggested = Some((buffer.entity_id(), snapshot));
         let cursor_position = edits
             .last()
             .map(|(range, text)| PredictedCursorPosition::new(range.start, text.len()));
         Some(EditPrediction::Local {
-            id: Some(current.id.clone()),
+            id: Some(id),
             edits,
             cursor_position,
-            edit_preview: Some(current.edit_preview.clone()),
+            edit_preview: Some(edit_preview),
         })
     }
 }

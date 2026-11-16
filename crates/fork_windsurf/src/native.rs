@@ -18,11 +18,14 @@ use http_client::HttpClient;
 use sha2::{Digest as _, Sha512};
 
 use crate::{
-    backend::{TabBackend, TabExchange, TabRequestInput},
+    backend::{FeedbackReport, TabBackend, TabExchange, TabRequestInput},
     proto::{
         exa::{
-            api_server_pb::GetChatMessageRequest,
-            codeium_common_pb::{Metadata, Model},
+            api_server_pb::{
+                FeedbackExtraInfo, FeedbackType, GetChatMessageRequest, GetTabRequest,
+                ProvideFeedbackRequest, ProvideFeedbackResponse,
+            },
+            codeium_common_pb::{CompletionSource, Metadata, Model, ProviderSource},
         },
         google::protobuf::Timestamp,
     },
@@ -78,6 +81,7 @@ impl Default for ClientConfig {
 
 pub const GET_USER_JWT_PATH: &str = "/exa.auth_pb.AuthService/GetUserJwt";
 pub const GET_TAB_PATH: &str = "/exa.api_server_pb.ApiServerService/GetTab";
+pub const PROVIDE_FEEDBACK_PATH: &str = "/exa.api_server_pb.ApiServerService/ProvideFeedback";
 
 static SESSION_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -167,42 +171,122 @@ impl NativeBackend {
                     result: Err(error),
                     elapsed: started_at.elapsed(),
                     first_delta_after: None,
+                    request_bytes: 0,
+                    resent_full_trajectory: false,
                 };
             }
         };
-        let trigger_id = uuid::Uuid::new_v4().to_string();
-        let metadata = metadata(&self.config, &api_key, Some(&user_jwt), Some(&trigger_id));
-        let request = get_tab::build_request(&self.config, metadata, input);
+        let full_steps = (!input.cached_hashes.is_empty()).then(|| input.steps.clone());
+        let metadata = metadata(
+            &self.config,
+            &api_key,
+            Some(&user_jwt),
+            Some(&input.trigger_id),
+        );
+        let mut request = get_tab::build_request(&self.config, metadata, input);
+        let mut resent_full_trajectory = false;
+        loop {
+            let (result, first_delta_after) = self.send_get_tab(&request).await;
+            let missing_information = matches!(&result, Ok(stream) if stream.missing_information);
+            if missing_information
+                && !resent_full_trajectory
+                && get_tab::uses_cached_hashes(&request)
+                && let Some(steps) = full_steps.clone()
+            {
+                log::info!(
+                    "windsurf: the server doesn't know the cached trajectory hashes; resending the full trajectory"
+                );
+                request = get_tab::with_full_trajectory(request, steps);
+                resent_full_trajectory = true;
+                continue;
+            }
+            let result = match result {
+                Ok(_) if missing_information => {
+                    log::warn!(
+                        "windsurf: the server reported missing trajectory information for a full trajectory; giving up on this request"
+                    );
+                    Err(ConnectError::Protocol(
+                        "server reported missing trajectory information for a full trajectory"
+                            .to_string(),
+                    ))
+                }
+                Ok(stream) => Ok(stream),
+                Err(error) => {
+                    if matches!(error, ConnectError::Unauthenticated(_)) {
+                        self.auth.clear().await;
+                    }
+                    Err(error)
+                }
+            };
+            let request_bytes = prost::Message::encoded_len(&request);
+            return TabExchange {
+                request: Some(request),
+                result,
+                elapsed: started_at.elapsed(),
+                first_delta_after,
+                request_bytes,
+                resent_full_trajectory,
+            };
+        }
+    }
+
+    async fn send_get_tab(
+        &self,
+        request: &GetTabRequest,
+    ) -> (Result<TabStream, ConnectError>, Option<Duration>) {
         let url = format!("{}{}", self.config.inference_server_url, GET_TAB_PATH);
         let sent_at = Instant::now();
         let mut stream = TabStream::default();
         let mut first_delta_after = None;
         let result = self
             .connect
-            .server_stream(&url, &request, self.config.get_tab_timeout, |response| {
+            .server_stream(&url, request, self.config.get_tab_timeout, |response| {
                 if stream.push(response) && first_delta_after.is_none() {
                     first_delta_after = Some(sent_at.elapsed());
                 }
             })
             .await;
-        let result = match result {
-            Ok(()) if stream.missing_information => Err(ConnectError::Protocol(
-                "server reported missing trajectory information for a full trajectory".to_string(),
-            )),
-            Ok(()) => Ok(stream),
-            Err(error) => {
-                if matches!(error, ConnectError::Unauthenticated(_)) {
-                    self.auth.clear().await;
-                }
-                Err(error)
-            }
+        (result.map(|()| stream), first_delta_after)
+    }
+
+    async fn send_feedback(
+        self,
+        api_key: String,
+        report: FeedbackReport,
+    ) -> Result<(), ConnectError> {
+        let user_jwt = self
+            .auth
+            .user_jwt(&self.connect, &self.config, &api_key)
+            .await?;
+        let request = ProvideFeedbackRequest {
+            metadata: Some(metadata(&self.config, &api_key, Some(&user_jwt), None)),
+            prompt_id: report.prompt_id,
+            completion_id: report.completion_id,
+            source: if report.from_cache {
+                CompletionSource::Cache
+            } else {
+                CompletionSource::Network
+            } as i32,
+            feedback: if report.accepted {
+                FeedbackType::Accept
+            } else {
+                FeedbackType::Reject
+            } as i32,
+            extra_info: if report.accepted {
+                FeedbackExtraInfo::Unspecified
+            } else {
+                FeedbackExtraInfo::IntentionalReject
+            } as i32,
+            timestamp_unix_ms: report.timestamp_unix_ms,
+            feedback_delay_ms: report.feedback_delay_ms,
+            provider_source: ProviderSource::Supercomplete as i32,
+            ..Default::default()
         };
-        TabExchange {
-            request: Some(request),
-            result,
-            elapsed: started_at.elapsed(),
-            first_delta_after,
-        }
+        let url = format!("{}{}", self.config.api_server_url, PROVIDE_FEEDBACK_PATH);
+        self.connect
+            .unary::<_, ProvideFeedbackResponse>(&url, &request, self.config.unary_timeout)
+            .await
+            .map(|_response| ())
     }
 }
 
@@ -222,5 +306,13 @@ impl TabBackend for NativeBackend {
     fn forget_credentials(&self) -> BoxFuture<'static, ()> {
         let auth = self.auth.clone();
         async move { auth.clear().await }.boxed()
+    }
+
+    fn provide_feedback(
+        &self,
+        api_key: String,
+        report: FeedbackReport,
+    ) -> BoxFuture<'static, Result<(), ConnectError>> {
+        self.clone().send_feedback(api_key, report).boxed()
     }
 }

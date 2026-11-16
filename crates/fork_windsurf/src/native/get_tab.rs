@@ -8,11 +8,15 @@ use super::{ClientConfig, timestamp};
 use crate::{
     backend::TabRequestInput,
     proto::exa::{
-        api_server_pb::{GetTabRequest, GetTabResponse, delta_tab, get_tab_response},
-        codeium_common_pb::{CommandRequestSource, Document, Metadata, ProviderSource, StopReason},
+        api_server_pb::{
+            GetTabRequest, GetTabResponse, TabTrajectoryStepsV2, delta_tab, get_tab_response,
+        },
+        codeium_common_pb::{
+            CommandRequestSource, Document, DocumentPosition, Metadata, ProviderSource, StopReason,
+        },
         cortex_pb::{
             CortexTrajectory, CortexTrajectoryMetadata, CortexTrajectoryReference,
-            CortexTrajectoryType,
+            CortexTrajectoryStep, CortexTrajectoryType,
         },
         prompt_pb::{CommandIntentInfo, SupercompleteFeedbackContext, UnifiedPromptComponents},
     },
@@ -21,6 +25,10 @@ use crate::{
 pub const INSTRUCTION: &str = "Please modify the following mentioned code block with the logical next edit. The <|cursor|> in the code block represents where my cursor is.";
 const STREAMING_COMPLETION_VERSION: i32 = 2;
 
+/// Builds the request. When `input.cached_hashes` covers a prefix of the
+/// steps, those steps are sent as hashes in `trajectory_steps_v2` together
+/// with the steps after them, and `cortex_trajectory.steps` stays empty
+/// (`fork/spike/结论.md` 问题 10).
 pub fn build_request(
     config: &ClientConfig,
     metadata: Metadata,
@@ -33,12 +41,31 @@ pub fn build_request(
         workspace_uri: document.workspace_uri,
         text: document.text,
         editor_language: document.editor_language,
-        language: document.language as i32,
         cursor_offset: document.cursor_offset as u64,
+        cursor_position: document
+            .cursor_position
+            .map(|(row, column)| DocumentPosition {
+                row: u64::from(row),
+                col: u64::from(column),
+            }),
         line_ending: "\n".to_string(),
         timestamp: Some(now),
         is_dirty: document.is_dirty,
         ..Default::default()
+    };
+    let cached_count = input.cached_hashes.len();
+    let (steps, trajectory_steps_v2) = if cached_count > 0 && cached_count <= input.steps.len() {
+        let mut steps = input.steps;
+        let steps_after_hashes = steps.split_off(cached_count);
+        (
+            Vec::new(),
+            Some(TabTrajectoryStepsV2 {
+                hashes: input.cached_hashes,
+                steps_after_hashes,
+            }),
+        )
+    } else {
+        (input.steps, None)
     };
     GetTabRequest {
         metadata: Some(metadata),
@@ -46,7 +73,7 @@ pub fn build_request(
             cortex_trajectory: Some(CortexTrajectory {
                 trajectory_id: uuid::Uuid::new_v4().to_string(),
                 trajectory_type: CortexTrajectoryType::Supercomplete as i32,
-                steps: input.steps,
+                steps,
                 parent_references: vec![CortexTrajectoryReference {
                     trajectory_id: input.mainline_trajectory_id,
                     trajectory_type: CortexTrajectoryType::UserMainline as i32,
@@ -69,9 +96,12 @@ pub fn build_request(
                 ..Default::default()
             }),
             code_diagnostics: input.diagnostics,
-            supercomplete_feedback_context: Some(SupercompleteFeedbackContext::default()),
+            supercomplete_feedback_context: Some(SupercompleteFeedbackContext {
+                feedback: input.feedback,
+            }),
             ..Default::default()
         }),
+        trajectory_steps_v2,
         provider_source: ProviderSource::Supercomplete as i32,
         prompt_id: uuid::Uuid::new_v4().to_string(),
         language: document.language as i32,
@@ -79,6 +109,30 @@ pub fn build_request(
         streaming_completion_version: Some(STREAMING_COMPLETION_VERSION),
         ..Default::default()
     }
+}
+
+/// Turns a request that sent hashes into one that sends `steps` in full, for
+/// when the server reports that it doesn't know the hashes.
+pub fn with_full_trajectory(
+    mut request: GetTabRequest,
+    steps: Vec<CortexTrajectoryStep>,
+) -> GetTabRequest {
+    request.trajectory_steps_v2 = None;
+    if let Some(trajectory) = request
+        .unified_prompt_components
+        .as_mut()
+        .and_then(|components| components.cortex_trajectory.as_mut())
+    {
+        trajectory.steps = steps;
+    }
+    request
+}
+
+pub fn uses_cached_hashes(request: &GetTabRequest) -> bool {
+    request
+        .trajectory_steps_v2
+        .as_ref()
+        .is_some_and(|steps| !steps.hashes.is_empty())
 }
 
 /// The streamed `GetTab` result, accumulated in arrival order.
@@ -93,6 +147,8 @@ pub struct TabStream {
     pub tab_jump: bool,
     pub missing_information: bool,
     pub request_id: String,
+    /// `PreResponse.cache_info_v2.hashes`: one hash per step that was sent.
+    pub cache_hashes: Option<Vec<u64>>,
     pub deltas: usize,
 }
 
@@ -102,6 +158,9 @@ impl TabStream {
         match response.message {
             Some(get_tab_response::Message::PreResponse(pre_response)) => {
                 self.request_id = pre_response.request_id;
+                if let Some(cache_info) = pre_response.cache_info_v2 {
+                    self.cache_hashes = Some(cache_info.hashes);
+                }
                 false
             }
             Some(get_tab_response::Message::MissingInformation(_)) => {
@@ -218,6 +277,7 @@ mod tests {
                 new_text: "x = 1\ny = 2".to_string(),
                 stop_reason: Some("STOP_REASON_STOP_PATTERN".to_string()),
                 request_id: "request".to_string(),
+                cache_hashes: Some(vec![1, 2]),
                 deltas: 3,
                 ..Default::default()
             }
@@ -257,10 +317,14 @@ mod tests {
                 selection_start_line: 0,
                 selection_end_line: 2,
                 is_dirty: true,
+                cursor_position: None,
             },
             diagnostics: Vec::new(),
             steps: vec![Default::default()],
             mainline_trajectory_id: "mainline".to_string(),
+            cached_hashes: Vec::new(),
+            feedback: Vec::new(),
+            trigger_id: "trigger".to_string(),
         };
         let metadata = super::super::metadata(&config, "key", Some("jwt"), Some("trigger"));
         let request = build_request(&config, metadata, input);
@@ -306,5 +370,92 @@ mod tests {
             (document.cursor_offset, document.line_ending.as_str()),
             (3, "\n")
         );
+    }
+
+    fn step(name: &str) -> CortexTrajectoryStep {
+        CortexTrajectoryStep {
+            step: Some(
+                crate::proto::exa::cortex_pb::cortex_trajectory_step::Step::Clipboard(
+                    crate::proto::exa::cortex_pb::CortexStepClipboard {
+                        content: name.to_string(),
+                    },
+                ),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn input_with(steps: Vec<CortexTrajectoryStep>, cached_hashes: Vec<u64>) -> TabRequestInput {
+        TabRequestInput {
+            document: DocumentContext {
+                text: "a".to_string(),
+                absolute_uri: "file:///work/a.py".to_string(),
+                workspace_uri: "file:///work".to_string(),
+                language: Language::Python,
+                editor_language: "python".to_string(),
+                cursor_offset: 1,
+                selection: "a".to_string(),
+                selection_start_line: 0,
+                selection_end_line: 1,
+                is_dirty: true,
+                cursor_position: Some((0, 1)),
+            },
+            diagnostics: Vec::new(),
+            steps,
+            mainline_trajectory_id: "mainline".to_string(),
+            cached_hashes,
+            feedback: Vec::new(),
+            trigger_id: "trigger".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_cached_hashes_replace_known_steps() {
+        let config = ClientConfig::default();
+        let steps = vec![step("one"), step("two"), step("three")];
+        let metadata = super::super::metadata(&config, "key", Some("jwt"), Some("trigger"));
+        let request = build_request(
+            &config,
+            metadata.clone(),
+            input_with(steps.clone(), vec![11, 22]),
+        );
+        assert!(uses_cached_hashes(&request));
+        let trajectory_steps = request.trajectory_steps_v2.clone().expect("steps v2");
+        assert_eq!(trajectory_steps.hashes, vec![11, 22]);
+        assert_eq!(trajectory_steps.steps_after_hashes, vec![step("three")]);
+        let components = request
+            .unified_prompt_components
+            .clone()
+            .expect("components");
+        assert!(
+            components
+                .cortex_trajectory
+                .expect("trajectory")
+                .steps
+                .is_empty()
+        );
+        let document = components
+            .command_intent_info
+            .and_then(|intent| intent.input_document)
+            .expect("document");
+        assert_eq!(
+            document.cursor_position,
+            Some(DocumentPosition { row: 0, col: 1 })
+        );
+        assert_eq!(document.language, 0, "the official client leaves it unset");
+
+        let full = with_full_trajectory(request, steps.clone());
+        assert!(!uses_cached_hashes(&full));
+        assert!(full.trajectory_steps_v2.is_none());
+        assert_eq!(
+            full.unified_prompt_components
+                .and_then(|components| components.cortex_trajectory)
+                .map(|trajectory| trajectory.steps),
+            Some(steps.clone())
+        );
+
+        // More hashes than steps can't be a prefix: everything is sent.
+        let request = build_request(&config, metadata, input_with(steps, vec![1, 2, 3, 4]));
+        assert!(request.trajectory_steps_v2.is_none());
     }
 }
