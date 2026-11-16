@@ -1,14 +1,20 @@
 mod attach;
 mod convert;
 pub mod core;
+mod hover;
+mod nested;
 mod paste;
+mod pending_opens;
 mod state;
 mod status;
 
 #[cfg(test)]
+mod hover_tests;
+#[cfg(test)]
 mod tests;
 
 pub use convert::ToggleCurrentDocument;
+pub use nested::{LINK_PREFIX as HOVER_LINK_PREFIX, ParseNestedValue, handle_hover_link};
 
 use editor::Editor;
 use gpui::{App, AppContext as _, Context, Window};
@@ -48,6 +54,8 @@ pub fn init(cx: &mut App) {
 
 pub fn attach_editor(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     attach::attach(editor, window, cx);
+    hover::attach(editor, cx);
+    nested::attach(editor, cx);
 }
 
 pub fn status_items(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {

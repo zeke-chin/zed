@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use editor::{EditPredictionRequestTrigger, Editor};
+use editor::{EditPredictionRequestTrigger, Editor, hover_popover::ForkHoverLinkHandler};
 use gpui::{App, Context, Global, WeakEntity, Window};
 use settings::{
     ForkEditPredictionProvider, KeybindSource, KeymapFile, KeymapFileLoadResult, RegisterSetting,
@@ -42,6 +42,7 @@ pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
     fork_copy_anchor::init(cx);
     fork_json_explorer::init(cx);
     fork_windsurf::init(cx);
+    cx.set_global(ForkHoverLinkHandler(handle_hover_link));
 
     cx.observe_new(|editor: &mut Editor, window, cx: &mut Context<Editor>| {
         if !editor.mode().is_full() {
@@ -75,6 +76,16 @@ pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
         },
     )
     .detach();
+}
+
+/// Registered as the hover popover's handler for `zed-fork://` links (hook H7).
+/// Routes each link to the feature named by its host. Returning `false` lets
+/// the popover handle the link as usual.
+fn handle_hover_link(link: &str, window: &mut Window, cx: &mut App) -> bool {
+    if let Some(path) = link.strip_prefix(fork_json_explorer::HOVER_LINK_PREFIX) {
+        return fork_json_explorer::handle_hover_link(path, window, cx);
+    }
+    false
 }
 
 /// Called at the start of the official registry's provider assignment.
@@ -118,10 +129,10 @@ pub fn load_default_keymap(cx: &mut App) {
 mod tests {
     use fork_copy_anchor::CopyAnchorSettings;
     use fork_windsurf::WindsurfSettings;
-    use gpui::{App, UpdateGlobal as _};
+    use gpui::{App, TestAppContext, UpdateGlobal as _};
     use settings::{ForkEditPredictionProvider, Settings, SettingsStore, WindsurfBackend};
 
-    use super::ForkSettings;
+    use super::{ForkSettings, handle_hover_link};
 
     fn init_settings(cx: &mut App) {
         let store = SettingsStore::test(cx);
@@ -190,5 +201,28 @@ mod tests {
 
         assert!(result.result().is_err());
         assert!(CopyAnchorSettings::get_global(cx).enabled);
+    }
+
+    #[gpui::test]
+    fn test_hover_links_are_routed_by_feature(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            assert!(!handle_hover_link("https://zed.dev", window, cx));
+            assert!(!handle_hover_link(
+                "zed-fork://unknown/open?token=1",
+                window,
+                cx
+            ));
+            assert!(!handle_hover_link(
+                "zed-fork://json-explorer/unknown",
+                window,
+                cx
+            ));
+            assert!(handle_hover_link(
+                "zed-fork://json-explorer/open?token=12345",
+                window,
+                cx
+            ));
+        });
     }
 }
