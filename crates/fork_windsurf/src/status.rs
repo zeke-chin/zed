@@ -200,6 +200,7 @@ pub(crate) fn last_request_text(cx: &App) -> String {
         "trajectory_steps": windsurf.trajectory().steps().len(),
         "response": last_request.response,
         "request": last_request.request,
+        "tab_jump": crate::tab_jump::last_summary(cx),
     });
     serde_json::to_string_pretty(&summary)
         .unwrap_or_else(|error| format!("couldn't format the request: {error}"))

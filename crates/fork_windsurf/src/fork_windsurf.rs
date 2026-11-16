@@ -6,6 +6,7 @@ pub mod diff;
 pub mod native;
 pub mod proto;
 mod status;
+pub mod tab_jump;
 pub mod trajectory;
 
 #[cfg(test)]
@@ -454,6 +455,7 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn init_with_backend(backend: Arc<dyn TabBackend>, cx: &mut App) {
+    tab_jump::init(cx);
     let windsurf = cx.new(|cx| {
         let mut windsurf = Windsurf::new(backend);
         windsurf.apply_settings(cx);
@@ -518,7 +520,12 @@ pub fn assign_delegate(
     for buffer in editor.buffer().read(cx).all_buffers() {
         windsurf.update(cx, |windsurf, cx| windsurf.track_buffer(&buffer, cx));
     }
-    let delegate = cx.new(|cx| WindsurfDelegate::new(windsurf, cx));
+    let project = editor.project().map(|project| project.downgrade());
+    let delegate = cx.new(|cx| {
+        let mut delegate = WindsurfDelegate::new(windsurf, cx);
+        delegate.set_project(project);
+        delegate
+    });
     editor.set_edit_prediction_provider(Some(delegate), trigger, window, cx);
     true
 }

@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod connect;
+pub mod get_chat_message;
 pub mod get_tab;
 
 use std::{
@@ -19,12 +20,16 @@ use sha2::{Digest as _, Sha512};
 use crate::{
     backend::{TabBackend, TabExchange, TabRequestInput},
     proto::{
-        exa::codeium_common_pb::{Metadata, Model},
+        exa::{
+            api_server_pb::GetChatMessageRequest,
+            codeium_common_pb::{Metadata, Model},
+        },
         google::protobuf::Timestamp,
     },
 };
 use auth::Auth;
 use connect::{ConnectClient, ConnectError, Timer};
+use get_chat_message::ChatExchange;
 use get_tab::TabStream;
 
 /// Client identity and endpoints. These mirror what the official client sends
@@ -36,6 +41,8 @@ pub struct ClientConfig {
     pub api_server_url: String,
     pub inference_server_url: String,
     pub model: Model,
+    /// `TAB_JUMP_MODEL_CONFIG`.
+    pub tab_jump_model: Model,
     pub ide_name: &'static str,
     pub ide_version: &'static str,
     pub extension_name: &'static str,
@@ -45,6 +52,7 @@ pub struct ClientConfig {
     pub plan_name: &'static str,
     pub unary_timeout: Duration,
     pub get_tab_timeout: Duration,
+    pub get_chat_message_timeout: Duration,
 }
 
 impl Default for ClientConfig {
@@ -53,6 +61,7 @@ impl Default for ClientConfig {
             api_server_url: "https://server.codeium.com".to_string(),
             inference_server_url: "https://inference-us-west-lb.codeium.com".to_string(),
             model: Model::TabExperimental4,
+            tab_jump_model: Model::Chat20706,
             ide_name: "windsurf",
             ide_version: "3.10.48",
             extension_name: "windsurf",
@@ -62,6 +71,7 @@ impl Default for ClientConfig {
             plan_name: "Unset",
             unary_timeout: Duration::from_secs(10),
             get_tab_timeout: Duration::from_millis(9300),
+            get_chat_message_timeout: Duration::from_millis(9992),
         }
     }
 }
@@ -199,6 +209,14 @@ impl NativeBackend {
 impl TabBackend for NativeBackend {
     fn get_tab(&self, api_key: String, input: TabRequestInput) -> BoxFuture<'static, TabExchange> {
         self.clone().exchange(api_key, input).boxed()
+    }
+
+    fn get_chat_message(
+        &self,
+        api_key: String,
+        request: GetChatMessageRequest,
+    ) -> BoxFuture<'static, ChatExchange> {
+        self.clone().chat_exchange(api_key, request).boxed()
     }
 
     fn forget_credentials(&self) -> BoxFuture<'static, ()> {

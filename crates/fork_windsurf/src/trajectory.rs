@@ -77,6 +77,13 @@ impl Trajectory {
         self.buffers.contains_key(&buffer.entity_id())
     }
 
+    /// The tracked buffers that are still alive.
+    pub fn tracked_buffers(&self) -> impl Iterator<Item = Entity<Buffer>> + '_ {
+        self.buffers
+            .values()
+            .filter_map(|tracked| tracked.buffer.upgrade())
+    }
+
     /// Turns the edits made to each tracked buffer since the last call into
     /// one step per buffer.
     pub fn commit(&mut self, cx: &App) {

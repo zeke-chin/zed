@@ -6,26 +6,32 @@ use edit_prediction_types::{
     EditPrediction, EditPredictionDelegate, EditPredictionDiscardReason, EditPredictionIconSet,
     EditPredictionRequestTrigger, PredictedCursorPosition,
 };
-use gpui::{App, AppContext as _, Context, Entity, SharedString, Task};
+use gpui::{App, AppContext as _, Context, Entity, SharedString, Task, WeakEntity};
 use language::{Anchor, Buffer, BufferSnapshot, EditPreview, ToOffset as _};
+use project::Project;
 use ui::IconName;
 
 use crate::{
     Preparation, PreparedRequest, RequestOutcome, Windsurf, WindsurfSettings,
     diff::{PredictionError, prediction_edits},
     native::get_tab::TabStream,
+    tab_jump::{self, JumpOrigin},
 };
 use settings::Settings as _;
 
 /// Typing in quick succession only sends a request once it pauses this long.
 pub const DEBOUNCE: Duration = Duration::from_millis(100);
 
-struct CurrentPrediction {
-    id: SharedString,
-    buffer: Entity<Buffer>,
-    snapshot: BufferSnapshot,
-    edits: Arc<[(Range<Anchor>, Arc<str>)]>,
-    edit_preview: EditPreview,
+#[derive(Clone)]
+pub(crate) struct CurrentPrediction {
+    pub id: SharedString,
+    pub buffer: Entity<Buffer>,
+    pub snapshot: BufferSnapshot,
+    pub edits: Arc<[(Range<Anchor>, Arc<str>)]>,
+    pub edit_preview: EditPreview,
+    /// Set when the edits are in another file than the one they were
+    /// predicted for (Tab Jump).
+    pub jump: Option<JumpOrigin>,
 }
 
 impl CurrentPrediction {
@@ -39,6 +45,7 @@ pub struct WindsurfDelegate {
     windsurf: Entity<Windsurf>,
     pending_request: Option<(u64, Task<()>)>,
     current: Option<CurrentPrediction>,
+    project: Option<WeakEntity<Project>>,
 }
 
 impl WindsurfDelegate {
@@ -49,6 +56,19 @@ impl WindsurfDelegate {
             windsurf,
             pending_request: None,
             current: None,
+            project: None,
+        }
+    }
+
+    /// Lets Tab Jump open the files it may jump to.
+    pub fn set_project(&mut self, project: Option<WeakEntity<Project>>) {
+        self.project = project;
+    }
+
+    /// Takes over edits a Tab Jump from another editor left for `buffer`.
+    fn adopt_landing(&mut self, buffer: &Entity<Buffer>, cx: &mut App) {
+        if let Some(landing) = tab_jump::take_landing(buffer, cx) {
+            self.current = Some(landing);
         }
     }
 
@@ -94,6 +114,17 @@ impl WindsurfDelegate {
                 window,
                 abs_path,
             } = prepared;
+            let project = this.read_with(cx, |this, _| this.project.clone())?;
+            let tab_jump = tab_jump::start(
+                &windsurf,
+                project,
+                &buffer,
+                cursor,
+                request_id,
+                backend.clone(),
+                api_key.clone(),
+                cx,
+            );
             let exchange = cx.background_spawn(backend.get_tab(api_key, input)).await;
 
             let retry_at = match &exchange.result {
@@ -143,6 +174,14 @@ impl WindsurfDelegate {
                     windsurf.update(cx, |windsurf, cx| {
                         windsurf.finish_request(request_id, &exchange, outcome, cx)
                     });
+                    let jump = match (&prediction, tab_jump) {
+                        (Ok(None), Some(tab_jump)) => tab_jump.await,
+                        (_, Some(tab_jump)) => {
+                            tab_jump.detach();
+                            None
+                        }
+                        (_, None) => None,
+                    };
                     this.update(cx, |this, cx| {
                         this.finish_pending(request_id);
                         if let Ok(Some((edits, edit_preview))) = prediction {
@@ -152,7 +191,10 @@ impl WindsurfDelegate {
                                 snapshot,
                                 edits,
                                 edit_preview,
+                                jump: None,
                             });
+                        } else if let Some(jump) = jump {
+                            this.current = Some(jump);
                         }
                         cx.notify();
                     })?;
@@ -245,7 +287,7 @@ impl EditPredictionDelegate for WindsurfDelegate {
     }
 
     fn supports_jump_to_edit() -> bool {
-        false
+        tab_jump::is_enabled()
     }
 
     fn icons(&self, _cx: &App) -> EditPredictionIconSet {
@@ -274,6 +316,7 @@ impl EditPredictionDelegate for WindsurfDelegate {
         if !self.windsurf.read(cx).can_request(cx) {
             return;
         }
+        self.adopt_landing(&buffer, cx);
         if let Some(current) = &self.current
             && current.buffer == buffer
             && current.interpolate(&buffer.read(cx).snapshot()).is_some()
@@ -318,7 +361,9 @@ impl EditPredictionDelegate for WindsurfDelegate {
 
     fn discard(&mut self, _reason: EditPredictionDiscardReason, cx: &mut Context<Self>) {
         self.cancel_pending_request(cx);
-        self.current = None;
+        if let Some(current) = self.current.take() {
+            tab_jump::clear_landing(&current.id, cx);
+        }
     }
 
     fn suggest(
@@ -327,9 +372,26 @@ impl EditPredictionDelegate for WindsurfDelegate {
         _cursor_position: Anchor,
         cx: &mut Context<Self>,
     ) -> Option<EditPrediction> {
+        self.adopt_landing(buffer, cx);
         let current = self.current.as_ref()?;
         if &current.buffer != buffer {
-            return None;
+            let jump = current.jump.as_ref()?;
+            let stale = jump.buffer != *buffer
+                || &buffer.read(cx).version() != jump.snapshot.version()
+                || !tab_jump::is_landing_pending(&current.id, cx);
+            if stale {
+                if jump.buffer == *buffer {
+                    let id = current.id.clone();
+                    tab_jump::clear_landing(&id, cx);
+                    self.current = None;
+                }
+                return None;
+            }
+            return Some(EditPrediction::Jump {
+                id: Some(current.id.clone()),
+                snapshot: current.buffer.read(cx).snapshot(),
+                target: jump.target,
+            });
         }
         let snapshot = buffer.read(cx).snapshot();
         let Some(edits) = current.interpolate(&snapshot) else {

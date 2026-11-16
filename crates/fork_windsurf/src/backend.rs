@@ -4,12 +4,12 @@
 
 use std::time::Duration;
 
-use futures::future::BoxFuture;
+use futures::{FutureExt as _, future::BoxFuture};
 
 use crate::{
-    native::{connect::ConnectError, get_tab::TabStream},
+    native::{connect::ConnectError, get_chat_message::ChatExchange, get_tab::TabStream},
     proto::exa::{
-        api_server_pb::GetTabRequest,
+        api_server_pb::{GetChatMessageRequest, GetTabRequest},
         codeium_common_pb::{CodeDiagnostic, Language},
         cortex_pb::CortexTrajectoryStep,
     },
@@ -52,6 +52,23 @@ pub struct TabExchange {
 
 pub trait TabBackend: Send + Sync {
     fn get_tab(&self, api_key: String, input: TabRequestInput) -> BoxFuture<'static, TabExchange>;
+
+    /// Sends a Tab Jump request, see `tab_jump.rs`.
+    fn get_chat_message(
+        &self,
+        _api_key: String,
+        _request: GetChatMessageRequest,
+    ) -> BoxFuture<'static, ChatExchange> {
+        futures::future::ready(ChatExchange {
+            request: None,
+            result: Err(ConnectError::Protocol(
+                "this backend doesn't support Tab Jump".to_string(),
+            )),
+            elapsed: Duration::ZERO,
+            first_delta_after: None,
+        })
+        .boxed()
+    }
 
     /// Drops cached tokens, e.g. after the API key changed.
     fn forget_credentials(&self) -> BoxFuture<'static, ()>;
