@@ -1,0 +1,28 @@
+[package]
+name = "fork_ext"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fork_ext.rs"
+doctest = false
+
+[dependencies]
+editor.workspace = true
+fork_copy_anchor.workspace = true
+fork_json_explorer.workspace = true
+fork_windsurf.workspace = true
+gpui.workspace = true
+log.workspace = true
+settings.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }

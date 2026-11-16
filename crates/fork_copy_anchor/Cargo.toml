@@ -1,0 +1,19 @@
+[package]
+name = "fork_copy_anchor"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fork_copy_anchor.rs"
+doctest = false
+
+[dependencies]
+editor.workspace = true
+gpui.workspace = true
+settings.workspace = true
+workspace.workspace = true

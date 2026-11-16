@@ -1,0 +1,19 @@
+[package]
+name = "fork_json_explorer"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fork_json_explorer.rs"
+doctest = false
+
+[dependencies]
+editor.workspace = true
+gpui.workspace = true
+settings.workspace = true
+workspace.workspace = true
