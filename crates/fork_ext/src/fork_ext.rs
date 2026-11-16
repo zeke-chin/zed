@@ -130,7 +130,10 @@ mod tests {
     use fork_copy_anchor::CopyAnchorSettings;
     use fork_windsurf::WindsurfSettings;
     use gpui::{App, TestAppContext, UpdateGlobal as _};
-    use settings::{ForkEditPredictionProvider, Settings, SettingsStore, WindsurfBackend};
+    use settings::{
+        ForkEditPredictionProvider, KeymapFile, KeymapFileLoadResult, Settings, SettingsStore,
+        WindsurfBackend,
+    };
 
     use super::{ForkSettings, handle_hover_link};
 
@@ -189,6 +192,21 @@ mod tests {
         assert_eq!(windsurf.backend, WindsurfBackend::LanguageServer);
         assert_eq!(windsurf.api_key.as_deref(), Some("secret"));
         assert!(!format!("{windsurf:?}").contains("secret"));
+    }
+
+    #[gpui::test]
+    fn test_default_keymap_loads_without_errors(cx: &mut App) {
+        init_settings(cx);
+
+        match KeymapFile::load(super::DEFAULT_KEYMAP, cx) {
+            KeymapFileLoadResult::Success { key_bindings } => assert!(!key_bindings.is_empty()),
+            KeymapFileLoadResult::SomeFailedToLoad { error_message, .. } => {
+                panic!("fork default keymap has invalid bindings: {error_message}")
+            }
+            KeymapFileLoadResult::JsonParseFailure { error } => {
+                panic!("fork default keymap is not valid JSON: {error:#}")
+            }
+        }
     }
 
     #[gpui::test]

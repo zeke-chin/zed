@@ -368,13 +368,22 @@ fn test_toggle_via_keystroke_with_fork_binding(cx: &mut TestAppContext) {
     let original = formatted(COMPACT_JSON);
     let (fixture, cx) = setup(&original, language_named("JSON"), cx);
     cx.update(|_, cx| {
+        // The shared keymap also binds other fork crates' actions, which aren't
+        // linked into this test binary; fork_ext checks that the whole file loads.
         let bindings = match settings::KeymapFile::load(
             include_str!("../../../fork/keymaps/default-macos.json"),
             cx,
         ) {
-            settings::KeymapFileLoadResult::Success { key_bindings } => key_bindings,
-            _ => panic!("fork keymap should load"),
+            settings::KeymapFileLoadResult::Success { key_bindings }
+            | settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => key_bindings
+                .into_iter()
+                .filter(|binding| binding.action().name().starts_with("json_explorer::"))
+                .collect::<Vec<_>>(),
+            settings::KeymapFileLoadResult::JsonParseFailure { error } => {
+                panic!("fork keymap should parse: {error:#}")
+            }
         };
+        assert!(!bindings.is_empty());
         cx.bind_keys(bindings);
     });
 

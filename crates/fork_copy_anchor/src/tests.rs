@@ -3,8 +3,7 @@ use std::{sync::Arc, time::Duration};
 use editor::{Editor, SelectionEffects};
 use fs::{FakeFs, Fs};
 use gpui::{
-    AppContext as _,
-    Action as _, Entity, TestAppContext, UpdateGlobal as _, VisualTestContext,
+    Action as _, AppContext as _, Entity, TestAppContext, UpdateGlobal as _, VisualTestContext,
 };
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -115,7 +114,11 @@ async fn open_file(
     editor
 }
 
-fn select(editor: &Entity<Editor>, ranges: Vec<std::ops::Range<Point>>, cx: &mut VisualTestContext) {
+fn select(
+    editor: &Entity<Editor>,
+    ranges: Vec<std::ops::Range<Point>>,
+    cx: &mut VisualTestContext,
+) {
     editor.update_in(cx, |editor, window, cx| {
         editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
             selections.select_ranges(ranges)
@@ -305,7 +308,10 @@ async fn test_multi_buffer_view_copies_natively(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_plain_mode_copies_natively(cx: &mut TestAppContext) {
     let (fixture, cx) = setup(cx).await;
-    set_settings(r#"{ "fork": { "copy_anchor": { "context_mode": false } } }"#, cx);
+    set_settings(
+        r#"{ "fork": { "copy_anchor": { "context_mode": false } } }"#,
+        cx,
+    );
     select(
         &fixture.editor,
         vec![Point::new(0, 0)..Point::new(0, 7)],
@@ -376,9 +382,19 @@ async fn test_keybinding_uses_anchor_copy_and_falls_back_to_native(cx: &mut Test
             include_str!("../../../fork/keymaps/default-macos.json"),
             cx,
         );
-        let settings::KeymapFileLoadResult::Success { key_bindings } = bindings else {
-            panic!("fork keymap should load without errors");
+        // The shared keymap also binds other fork crates' actions, which aren't
+        // linked into this test binary; fork_ext checks that the whole file loads.
+        let key_bindings = match bindings {
+            settings::KeymapFileLoadResult::Success { key_bindings }
+            | settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => key_bindings
+                .into_iter()
+                .filter(|binding| binding.action().name().starts_with("copy_anchor::"))
+                .collect::<Vec<_>>(),
+            settings::KeymapFileLoadResult::JsonParseFailure { error } => {
+                panic!("fork keymap should parse: {error:#}")
+            }
         };
+        assert_eq!(key_bindings.len(), 2);
         cx.bind_keys([gpui::KeyBinding::new(
             "cmd-c",
             editor::actions::Copy,
@@ -561,7 +577,10 @@ async fn test_preview_disappears_after_duration_and_restarts_on_copy(cx: &mut Te
 #[gpui::test]
 async fn test_zero_duration_never_shows_a_preview(cx: &mut TestAppContext) {
     let (fixture, cx) = setup(cx).await;
-    set_settings(r#"{ "fork": { "copy_anchor": { "preview_duration": 0 } } }"#, cx);
+    set_settings(
+        r#"{ "fork": { "copy_anchor": { "preview_duration": 0 } } }"#,
+        cx,
+    );
     select(
         &fixture.editor,
         vec![Point::new(0, 0)..Point::new(0, 7)],
@@ -570,4 +589,3 @@ async fn test_zero_duration_never_shows_a_preview(cx: &mut TestAppContext) {
     dispatch_copy(cx);
     assert_eq!(preview(cx), None);
 }
-
