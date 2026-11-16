@@ -1,3 +1,6 @@
+mod credentials;
+
+pub use credentials::{ImportApiKey, OpenApiKeySetting};
 use gpui::App;
 use settings::{RegisterSetting, Settings, SettingsContent, WindsurfBackend};
 
@@ -51,4 +54,6 @@ impl std::fmt::Debug for WindsurfSettings {
     }
 }
 
-pub fn init(_cx: &mut App) {}
+pub fn init(cx: &mut App) {
+    credentials::init(cx);
+}

@@ -6587,8 +6587,20 @@ dependencies = [
 name = "fork_windsurf"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "editor",
+ "fs",
+ "futures 0.3.34",
  "gpui",
+ "language",
+ "log",
+ "paths",
+ "serde_json",
  "settings",
+ "sqlez",
+ "tempfile",
+ "util",
+ "workspace",
 ]
 
 [[package]]
