@@ -1,8 +1,15 @@
+mod copy;
 pub mod core;
+mod state;
+mod status;
+
+#[cfg(test)]
+mod tests;
 
 use editor::Editor;
-use gpui::{App, Context, Window};
+use gpui::{App, AppContext as _, Context, Window};
 use settings::{RegisterSetting, Settings, SettingsContent};
+use state::CopyAnchorModel;
 use workspace::Workspace;
 
 #[derive(Clone, Debug, PartialEq, RegisterSetting)]
@@ -36,13 +43,26 @@ impl Settings for CopyAnchorSettings {
     }
 }
 
-pub fn init(_cx: &mut App) {}
+pub use copy::{Copy, ToggleContextMode};
 
-pub fn attach_editor(_editor: &mut Editor, _window: &mut Window, _cx: &mut Context<Editor>) {}
+pub fn init(cx: &mut App) {
+    let model = CopyAnchorModel::install(cx);
+    copy::observe_settings(&model, cx);
+}
 
-pub fn status_items(
-    _workspace: &mut Workspace,
-    _window: &mut Window,
-    _cx: &mut Context<Workspace>,
-) {
+pub fn attach_editor(editor: &mut Editor, _window: &mut Window, cx: &mut Context<Editor>) {
+    copy::attach(editor, cx);
+}
+
+pub fn status_items(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.register_action(copy::toggle_context_mode);
+    let status_bar = workspace.status_bar().clone();
+    cx.defer_in(window, move |_, window, cx| {
+        let preview_item = cx.new(status::CopyPreviewItem::new);
+        let mode_item = cx.new(status::ModeItem::new);
+        status_bar.update(cx, |status_bar, cx| {
+            status_bar.add_left_item(preview_item, window, cx);
+            status_bar.add_right_item(mode_item, window, cx);
+        });
+    });
 }

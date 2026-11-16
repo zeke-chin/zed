@@ -1,1 +1,14 @@
-[]
+[
+  {
+    "context": "Editor && copy_anchor_enabled && copy_anchor_has_selection",
+    "bindings": {
+      "cmd-c": "copy_anchor::Copy"
+    }
+  },
+  {
+    "context": "Editor && copy_anchor_enabled",
+    "bindings": {
+      "ctrl-\\ ctrl-\\": "copy_anchor::ToggleContextMode"
+    }
+  }
+]

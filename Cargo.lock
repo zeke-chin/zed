@@ -6520,9 +6520,24 @@ dependencies = [
 name = "fork_copy_anchor"
 version = "0.1.0"
 dependencies = [
+ "assets",
+ "db",
  "editor",
+ "fs",
  "gpui",
+ "language",
+ "log",
+ "multi_buffer",
+ "paths",
+ "project",
+ "release_channel",
+ "semver",
+ "serde_json",
  "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
  "workspace",
 ]
 
