@@ -3,6 +3,8 @@ mod agent;
 mod editor;
 mod extension;
 mod fallible_options;
+// FORK: settings for the fork's own features
+mod fork;
 mod language;
 mod language_model;
 pub mod merge_from;
@@ -19,6 +21,8 @@ use anyhow::Context;
 pub use editor::*;
 pub use extension::*;
 pub use fallible_options::*;
+// FORK: settings for the fork's own features
+pub use fork::*;
 pub use language::*;
 pub use language_model::*;
 pub use merge_from::MergeFrom as MergeFromTrait;
@@ -336,6 +340,9 @@ pub struct SettingsContent {
     /// Settings for developer-oriented instrumentation tools (profilers,
     /// tracers, etc.) that can be toggled at runtime.
     pub instrumentation: Option<InstrumentationSettingsContent>,
+
+    // FORK: settings for the fork's own features
+    pub fork: Option<ForkSettingsContent>,
 }
 
 /// Configuration for developer-oriented instrumentation tools that collect
@@ -414,6 +421,8 @@ fallible_options::flattened_deserialize!(SettingsContent {
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
         instrumentation,
+        // FORK: settings for the fork's own features
+        fork,
     },
     defaults: {},
 });

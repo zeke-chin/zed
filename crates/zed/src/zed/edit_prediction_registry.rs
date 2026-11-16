@@ -219,6 +219,11 @@ fn assign_edit_prediction_provider(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
+    // FORK: let the fork's edit prediction provider take precedence over the official setting
+    if fork_ext::assign_edit_prediction_provider(editor, trigger, window, cx) {
+        return;
+    }
+
     // TODO: Do we really want to collect data only for singleton buffers?
     let singleton_buffer = editor.buffer().read(cx).as_singleton();
 

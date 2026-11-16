@@ -80,6 +80,11 @@ members = [
     "crates/feature_flags",
     "crates/feature_flags_macros",
     "crates/feedback",
+    # FORK: the fork's own crates
+    "crates/fork_copy_anchor",
+    "crates/fork_ext",
+    "crates/fork_json_explorer",
+    "crates/fork_windsurf",
     "crates/file_content",
     "crates/file_finder",
     "crates/file_icons",
@@ -357,6 +362,11 @@ extensions_ui = { path = "crates/extensions_ui" }
 feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
 feedback = { path = "crates/feedback" }
+# FORK: the fork's own crates
+fork_copy_anchor = { path = "crates/fork_copy_anchor" }
+fork_ext = { path = "crates/fork_ext" }
+fork_json_explorer = { path = "crates/fork_json_explorer" }
+fork_windsurf = { path = "crates/fork_windsurf" }
 file_content = { path = "crates/file_content" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }

@@ -2393,6 +2393,9 @@ pub fn load_default_keymap(cx: &mut App) {
         )
         .unwrap(),
     );
+
+    // FORK: bind the fork's default keys after Zed's defaults and before user keys
+    fork_ext::load_default_keymap(cx);
 }
 
 /// Namespaces of actions that are part of an AI feature. When the user opts out
