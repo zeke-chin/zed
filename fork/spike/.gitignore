@@ -1,0 +1,13 @@
+# 真实凭据
+.env
+# 原始抓包（含凭据和代码内容）
+captures/
+# 虚拟环境与缓存
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+# 临时文件、LS 二进制副本、LS 运行目录
+.scratch/
+.cache/
+.lsrun/

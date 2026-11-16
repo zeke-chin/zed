@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# 从官方 LS 二进制提取 proto。用法：fork/spike/extract-proto [LS 路径] [输出目录]
+# 默认 LS 路径：.env 的 WINDSURF_LS_PATH，或常见安装位置；默认输出：fork/spike/proto-out
+set -euo pipefail
+source "$(dirname "$0")/lib/bootstrap.sh"
+LS="${1:-$("$PY" -m common ls-path)}"
+OUT="${2:-$SPIKE_DIR/proto-out}"
+exec "$PY" "$SPIKE_DIR/lib/extract_proto.py" "$LS" --out "$OUT"

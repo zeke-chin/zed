@@ -1,0 +1,22 @@
+binary: /Applications/Devin.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm
+size: 176229680
+sha256: fc62733ad0eb9f8695ac596131d096c4dc1eb95296c6f3eaf8d395bb51477b17
+
+--stamp 输出:
+STABLE_BUILD_SCM_REVISION: fcf7ba39e6150055fad817f8716385b4d320d46d
+STABLE_BUILD_SCM_STATUS: clean
+BUILD_TIMESTAMP: 1790649487
+BUILD_HOST: chi22-dq227-ae857a39-edd2-4dc9-9707-1a7d52dc7b5f-6E6552F2EE4D.local
+BUILD_USER: runner
+{
+ "NumSockets": 1,
+ "NumCores": 16,
+ "NumThreads": 16,
+ "VendorID": "",
+ "Family": "0",
+ "Model": "0",
+ "ModelName": "Apple M3 Max",
+ "Memory": 68719476736
+}
+2026/11/16 12:39:05 maxprocs: Leaving GOMAXPROCS=16: CPU quota undefined
+I1116 12:39:05.826615 13373 main.go:581] [Language Server Manager] Setting GOMAXPROCS to 4

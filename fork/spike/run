@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# 验证脚本统一入口。用法：fork/spike/run <命令> [参数...]
+#   import-key        从本机 Devin 登录数据导入 api_key 到 .env（唯一读取本机登录数据的命令）
+#   get-tab           不经过 LS，直连云端发一次自己构造的 GetTab，打印预测
+#   ls-tab            拉起官方 LS，调一次 HandleStreamingTabV2（备选路线最小验证）
+#   capture           拉起官方 LS + 本地记录代理，按场景驱动 LS，两段流量写入 captures/
+#   decode            把 captures/ 里的记录解码成可读 JSON
+#   probe             对 GetTab 做字段替换实验（低频、串行）
+#   latency           延迟测量（直连 / 经 LS）
+#   show-msg          打印 proto 消息结构
+#   analyze           按 trigger_id 对应两段流量，统计每次触发的上下文
+set -euo pipefail
+source "$(dirname "$0")/lib/bootstrap.sh"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  import-key) exec "$PY" "$SPIKE_DIR/lib/import_key.py" "$@" ;;
+  get-tab)    exec "$PY" "$SPIKE_DIR/lib/get_tab.py" "$@" ;;
+  ls-tab)     exec "$PY" "$SPIKE_DIR/lib/ls_driver.py" tab "$@" ;;
+  capture)    exec "$PY" "$SPIKE_DIR/lib/ls_driver.py" capture "$@" ;;
+  decode)     exec "$PY" "$SPIKE_DIR/lib/decode.py" "$@" ;;
+  probe)      exec "$PY" "$SPIKE_DIR/lib/probe.py" "$@" ;;
+  latency)    exec "$PY" "$SPIKE_DIR/lib/latency.py" "$@" ;;
+  show-msg)   exec "$PY" "$SPIKE_DIR/lib/show_msg.py" "$@" ;;
+  analyze)    exec "$PY" "$SPIKE_DIR/lib/analyze.py" "$@" ;;
+  *) sed -n '2,13p' "$0"; exit 1 ;;
+esac

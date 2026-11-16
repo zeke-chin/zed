@@ -1,0 +1,10 @@
+// 由 fork/spike/extract-proto 从官方 LS 二进制还原，请勿手改
+syntax = "proto3";
+
+package google.protobuf;
+
+option go_package = "google.golang.org/protobuf/types/known/emptypb";
+
+message Empty {
+}
+
