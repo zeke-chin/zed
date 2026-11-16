@@ -299,9 +299,9 @@ fn api_key_value_position(text: &str) -> Option<Point> {
 mod tests {
     use super::*;
     use fs::Fs as _;
-    use std::sync::Arc;
     use gpui::TestAppContext;
     use settings::SettingsStore;
+    use std::sync::Arc;
 
     const SAMPLE_KEY: &str = "devin-sk-0123456789abcdef0123456789abcdef";
 
