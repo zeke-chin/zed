@@ -80,11 +80,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 和官方一样，两个架构都在 Apple Silicon runner 上编译，x86_64 是交叉编译。
         arch: [aarch64, x86_64]
     name: bundle_mac_${{ matrix.arch }}
-    # bundle-mac 要求 macOS SDK 26+，也就是 Xcode 26。
-    runs-on: macos-26
+    # 免费的 arm64 macOS runner（macos-15、macos-26）经常排队 15 分钟拿不到机器被取消，
+    # 改用 Intel runner，aarch64 交叉编译（官方是在 Apple Silicon 上交叉编译 x86_64）。
+    runs-on: macos-15-intel
     timeout-minutes: 300
     defaults:
       run:
@@ -103,6 +103,12 @@ jobs:
       with:
         node-version: '24'
         package-manager-cache: false
+    - name: select_xcode_26
+      # bundle-mac 要求 macOS SDK 26+；macos-15 镜像默认是 Xcode 16，另装了几个 Xcode 26，取最新的。
+      run: |
+        xcode="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+        test -n "$xcode"
+        echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
     - name: print_macos_toolchain
       run: |
         sw_vers
