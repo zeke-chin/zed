@@ -5970,7 +5970,7 @@ impl SidebarClickFixture {
                 .bounds_for_item(entry_index)
                 .expect("sidebar entry should be measured")
         });
-        cx.simulate_click(entry_bounds.center(), Modifiers::none());
+        cx.simulate_click(entry_bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
     }
 }
