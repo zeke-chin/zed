@@ -1,0 +1,183 @@
+# fork 自有的三平台打包，不由 `cargo xtask workflows` 生成。
+# 复用官方的 script/bundle-*，但跑在 GitHub 托管 runner 上（官方用的 Namespace / 自建 runner fork 用不了），
+# 不带签名、公证和 Sentry 相关 secrets，脚本会自动走未签名 / 本地临时签名路径。
+name: fork_bundle
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+    - fork-v*
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  CARGO_INCREMENTAL: '0'
+  # 与 fork/bundle.sh 一致：「关于」里的提交号带 -fork 后缀，crates/zed/build.rs 原样传给 rustc-env。
+  ZED_COMMIT_SHA: ${{ github.sha }}-fork
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bundle_linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: x86_64
+          runner: ubuntu-24.04
+        - arch: aarch64
+          runner: ubuntu-24.04-arm
+    name: bundle_linux_${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    env:
+      # 官方在 20.04 上从 PPA 装 clang-18；24.04 的默认 clang 就是 18。
+      CC: clang-18
+      CXX: clang++-18
+      LLD: /usr/bin/ld.lld-18
+    defaults:
+      run:
+        shell: bash -euxo pipefail {0}
+    steps:
+    - name: free_disk_space
+      # release 编译的 target 目录二十多 GB，托管 runner 默认剩余空间不够。
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+        df -h /
+    - name: checkout_repo
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+    - name: setup_linux
+      run: ./script/linux
+    - name: download_wasi_sdk
+      run: ./script/download-wasi-sdk
+    - name: bundle_linux
+      run: ./script/bundle-linux --skip-sentry
+    - name: upload_bundle
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: zed-linux-${{ matrix.arch }}.tar.gz
+        path: target/release/zed-linux-${{ matrix.arch }}.tar.gz
+        if-no-files-found: error
+    - name: upload_remote_server
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: zed-remote-server-linux-${{ matrix.arch }}.gz
+        path: target/zed-remote-server-linux-${{ matrix.arch }}.gz
+        if-no-files-found: error
+
+  bundle_mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 和官方一样，两个架构都在 Apple Silicon runner 上编译，x86_64 是交叉编译。
+        arch: [aarch64, x86_64]
+    name: bundle_mac_${{ matrix.arch }}
+    # bundle-mac 要求 macOS SDK 26+，也就是 Xcode 26。
+    runs-on: macos-26
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash -euxo pipefail {0}
+    steps:
+    - name: checkout_repo
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+    - name: setup_node
+      # bundle-mac 会 npm install --global dmg-license。
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      with:
+        node-version: '24'
+        package-manager-cache: false
+    - name: print_macos_toolchain
+      run: |
+        sw_vers
+        xcodebuild -version
+        xcrun --sdk macosx --show-sdk-version
+        df -h /
+    - name: bundle_mac
+      # 没有 MACOS_CERTIFICATE 等变量时 bundle-mac 用 codesign --sign - 做本地临时签名，不公证。
+      run: ./script/bundle-mac ${{ matrix.arch }}-apple-darwin
+    - name: upload_bundle
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: Zed-${{ matrix.arch }}.dmg
+        path: target/${{ matrix.arch }}-apple-darwin/release/Zed-${{ matrix.arch }}.dmg
+        if-no-files-found: error
+    - name: upload_remote_server
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: zed-remote-server-macos-${{ matrix.arch }}.gz
+        path: target/zed-remote-server-macos-${{ matrix.arch }}.gz
+        if-no-files-found: error
+
+  bundle_windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 和官方一样，aarch64 在 x64 机器上交叉编译。
+        arch: [x86_64, aarch64]
+    name: bundle_windows_${{ matrix.arch }}
+    # windows-2022 镜像自带 Inno Setup 6（bundle-windows.ps1 依赖它）；2025 镜像没有。
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      ZED_WORKSPACE: ${{ github.workspace }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+    - name: enable_long_paths
+      run: git config --system core.longpaths true
+    - name: checkout_repo
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+    - name: set_release_version
+      # CI 环境下 bundle-windows.ps1 要求 RELEASE_VERSION，官方由自建 runner 的环境提供。
+      run: |
+        $ErrorActionPreference = "Stop"
+        $match = Select-String -Path crates/zed/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1
+        if (-not $match) { throw "读不到 crates/zed/Cargo.toml 的 version" }
+        $version = $match.Matches[0].Groups[1].Value
+        Write-Host "RELEASE_VERSION=$version"
+        "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+    - name: bundle_windows
+      # 没有 AZURE_* 签名变量时脚本跳过代码签名，产出未签名的安装包。
+      run: script/bundle-windows.ps1 -Architecture ${{ matrix.arch }}
+    - name: upload_bundle
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: Zed-${{ matrix.arch }}.exe
+        path: target/Zed-${{ matrix.arch }}.exe
+        if-no-files-found: error
+    - name: upload_remote_server
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: zed-remote-server-windows-${{ matrix.arch }}.zip
+        path: target/zed-remote-server-windows-${{ matrix.arch }}.zip
+        if-no-files-found: error
+
+  publish_release:
+    # 只有推送 fork-v* tag 时才发 GitHub Release；手动触发只留 Actions 产物。
+    if: startsWith(github.ref, 'refs/tags/fork-v')
+    needs: [bundle_linux, bundle_mac, bundle_windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - name: download_artifacts
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        path: dist
+        merge-multiple: true
+    - name: create_release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.ref_name }}
+      run: |
+        set -euo pipefail
+        ls -la dist
+        gh release create "$TAG" dist/* \
+          --repo "$GITHUB_REPOSITORY" \
+          --title "$TAG" \
+          --notes "fork 构建，提交 ${GITHUB_SHA}。未签名、未公证：macOS 首次打开需右键「打开」或执行 xattr -dr com.apple.quarantine \"/Applications/Zed Dev.app\"；Windows 会有 SmartScreen 提示。" \
+          --prerelease

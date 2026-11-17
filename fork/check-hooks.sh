@@ -19,6 +19,8 @@ hooks_file="fork/HOOKS.md"
 is_fork_owned() {
     case "$1" in
         fork/* | crates/fork_*/* | crates/settings_content/src/fork.rs | crates/git_ui/src/git_panel/fork_vscode_layout.rs | crates/git_ui/src/git_panel/fork_vscode_layout/* | crates/git_ui/src/blame_ui/fork_gitlens_popover.rs | assets/icons/fork/*) return 0 ;;
+        # fork 自己的 CI，新文件，不会和上游冲突。
+        .github/workflows/fork_*) return 0 ;;
         # 仓库规则要求的 PR 自查标记，每处改动都要带上，见 HOOKS.md。
         README.md) return 0 ;;
         # 新增 crate 带来的锁文件变化，变基冲突时重新生成即可，见 HOOKS.md。
