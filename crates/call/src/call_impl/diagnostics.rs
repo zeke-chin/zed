@@ -305,12 +305,13 @@ fn compute_network_stats(stats: &livekit_client::SessionStats) -> ComputedNetwor
 }
 
 #[cfg(all(
-    not(rust_analyzer),
+    any(not(rust_analyzer), zed_no_webrtc),
     any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     )
 ))]
 fn compute_remote_audio_stats(
@@ -325,12 +326,13 @@ fn compute_remote_audio_stats(
 }
 
 #[cfg(any(
-    rust_analyzer,
+    all(rust_analyzer, not(zed_no_webrtc)),
     not(any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     ))
 ))]
 fn compute_remote_audio_stats(
@@ -458,12 +460,13 @@ fn compute_remote_audio_stats(
 }
 
 #[cfg(all(
-    not(rust_analyzer),
+    any(not(rust_analyzer), zed_no_webrtc),
     any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     )
 ))]
 fn extract_metrics(
@@ -476,12 +479,13 @@ fn extract_metrics(
 }
 
 #[cfg(any(
-    rust_analyzer,
+    all(rust_analyzer, not(zed_no_webrtc)),
     not(any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     ))
 ))]
 fn extract_metrics(
