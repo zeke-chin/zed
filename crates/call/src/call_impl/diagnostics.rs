@@ -235,7 +235,7 @@ impl Serialize for ConnectionQualityDTO {
     }
 }
 
-#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-support", zed_no_webrtc), allow(dead_code))]
 struct TrackContext {
     participant_id: String,
     participant_name: String,
@@ -250,7 +250,7 @@ struct PollResult {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
+#[cfg_attr(any(test, feature = "test-support", zed_no_webrtc), allow(dead_code))]
 struct InboundCounters {
     packets_received: u64,
     packets_lost: i64,
