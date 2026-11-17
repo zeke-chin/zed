@@ -22,5 +22,37 @@
     "bindings": {
       "ctrl-cmd-w": "window_switcher::Toggle"
     }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "cmd-shift-f": "fork_search_panel::Deploy"
+    }
+  },
+  {
+    "context": "Editor",
+    "bindings": {
+      "cmd-shift-f": "fork_search_panel::Deploy"
+    }
+  },
+  {
+    "context": "ForkSearchPanel",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "cmd-enter": "fork_search_panel::OpenSelected",
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "left": "fork_search_panel::Collapse",
+      "right": "fork_search_panel::Expand",
+      "escape": "menu::Cancel"
+    }
+  },
+  {
+    "context": "Editor && fork_search_input",
+    "bindings": {
+      "enter": "fork_search_panel::Search",
+      "down": "fork_search_panel::FocusResults",
+      "cmd-enter": "fork_search_panel::OpenInEditor"
+    }
   }
 ]

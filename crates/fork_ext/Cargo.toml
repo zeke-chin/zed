@@ -16,6 +16,7 @@ doctest = false
 editor.workspace = true
 fork_copy_anchor.workspace = true
 fork_json_explorer.workspace = true
+fork_search_panel.workspace = true
 fork_windsurf.workspace = true
 fork_window_switcher.workspace = true
 gpui.workspace = true

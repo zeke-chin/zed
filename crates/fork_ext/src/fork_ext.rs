@@ -43,6 +43,7 @@ pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
     fork_json_explorer::init(cx);
     fork_windsurf::init(cx);
     fork_window_switcher::init(cx);
+    fork_search_panel::init(cx);
     observe_edit_prediction_settings(cx);
     cx.set_global(ForkHoverLinkHandler(handle_hover_link));
 
@@ -70,6 +71,7 @@ pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
             let Some(window) = window else {
                 return;
             };
+            fork_search_panel::attach_workspace(workspace, window, cx);
             fork_copy_anchor::status_items(workspace, window, cx);
             fork_json_explorer::status_items(workspace, window, cx);
             fork_windsurf::status_items(workspace, window, cx);

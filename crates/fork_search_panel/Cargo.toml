@@ -1,0 +1,41 @@
+[package]
+name = "fork_search_panel"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fork_search_panel.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+editor.workspace = true
+file_icons.workspace = true
+futures.workspace = true
+gpui.workspace = true
+language.workspace = true
+menu.workspace = true
+project.workspace = true
+search.workspace = true
+settings.workspace = true
+theme_settings.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
+editor = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+search = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+theme.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

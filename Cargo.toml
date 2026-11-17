@@ -85,6 +85,7 @@ members = [
     "crates/fork_ext",
     "crates/fork_json_explorer",
     "crates/fork_markdown_preview",
+    "crates/fork_search_panel",
     "crates/fork_windsurf",
     "crates/fork_window_switcher",
     "crates/file_content",
@@ -369,6 +370,7 @@ fork_copy_anchor = { path = "crates/fork_copy_anchor" }
 fork_ext = { path = "crates/fork_ext" }
 fork_json_explorer = { path = "crates/fork_json_explorer" }
 fork_markdown_preview = { path = "crates/fork_markdown_preview" }
+fork_search_panel = { path = "crates/fork_search_panel" }
 fork_windsurf = { path = "crates/fork_windsurf" }
 fork_window_switcher = { path = "crates/fork_window_switcher" }
 file_content = { path = "crates/file_content" }

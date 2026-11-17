@@ -30,7 +30,7 @@ FORK_BRANCH="fork"
 SKIP_CARGO=0
 OLD_BASE_ARG=""
 TARGET=""
-FORK_CRATES="fork_ext fork_copy_anchor fork_json_explorer fork_windsurf"
+FORK_CRATES="fork_ext fork_copy_anchor fork_json_explorer fork_windsurf fork_search_panel"
 
 usage() {
     # 打印文件头部的注释作为帮助（只用 POSIX sed 语法，兼容 BSD sed）。
