@@ -5727,22 +5727,32 @@ impl GitPanel {
     pub(crate) fn increase_font_size(
         &mut self,
         action: &IncreaseBufferFontSize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.handle_font_size_action(action.persist, px(1.0), cx);
+        self.handle_font_size_action(action.persist, px(1.0), window, cx);
     }
 
     pub(crate) fn decrease_font_size(
         &mut self,
         action: &DecreaseBufferFontSize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.handle_font_size_action(action.persist, px(-1.0), cx);
+        self.handle_font_size_action(action.persist, px(-1.0), window, cx);
     }
 
-    fn handle_font_size_action(&mut self, persist: bool, delta: Pixels, cx: &mut Context<Self>) {
+    fn handle_font_size_action(
+        &mut self,
+        persist: bool,
+        delta: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        // FORK: VS Code commit input scales from its UI font size, not the buffer fallback (H11).
+        if self.fork_handle_font_size_action(persist, delta, window, cx) {
+            return;
+        }
         if persist {
             update_settings_file(self.fs.clone(), cx, move |settings, cx| {
                 let git_commit_buffer_font_size =

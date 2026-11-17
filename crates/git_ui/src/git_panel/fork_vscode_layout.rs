@@ -14,8 +14,8 @@ mod graph;
 use super::*;
 use gpui::{DragMoveEvent, EntityId, FontWeight, Hsla, MouseUpEvent};
 use settings::{
-    ForkGitPanelLayout, ForkGitPanelSettingsContent, RegisterSetting, Settings, SettingsContent,
-    SettingsStore,
+    ForkGitPanelLayout, ForkGitPanelSettingsContent, ProfileBase, RegisterSetting, Settings,
+    SettingsContent, SettingsFile, SettingsStore, UserSettingsContentExt,
 };
 
 /// Height of the history section when the user hasn't resized it, as a share
@@ -50,6 +50,40 @@ pub(crate) fn fork_group_by(
         GitPanelGroupBy::Staging
     } else {
         group_by
+    }
+}
+
+fn fork_commit_editor_font_size(rem_size: Pixels, cx: &App) -> Pixels {
+    let settings = ThemeSettings::get_global(cx);
+    if cx.has_global::<theme_settings::GitCommitBufferFontSize>() {
+        return settings.git_commit_buffer_font_size(cx);
+    }
+
+    // The upstream default is 12px, so the merged theme cannot tell whether it was configured.
+    let store = cx.global::<SettingsStore>();
+    let has_font_size =
+        |content: &SettingsContent| content.theme.git_commit_buffer_font_size.is_some();
+    let configured_in_user_settings = store.raw_user_settings().is_some_and(|user_settings| {
+        let profile = user_settings.for_profile(cx);
+        profile.is_some_and(|profile| has_font_size(&profile.settings))
+            || (profile.is_none_or(|profile| profile.base == ProfileBase::User)
+                && [
+                    Some(user_settings.content.as_ref()),
+                    user_settings.for_release_channel(),
+                    user_settings.for_os(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(has_font_size))
+    });
+    let configured_in_other_settings = [SettingsFile::Global, SettingsFile::Server]
+        .into_iter()
+        .filter_map(|file| store.get_content_for_file(file))
+        .any(has_font_size);
+    if configured_in_user_settings || configured_in_other_settings {
+        settings.git_commit_buffer_font_size(cx)
+    } else {
+        TextSize::Default.rems(cx).to_pixels(rem_size)
     }
 }
 
@@ -608,6 +642,32 @@ impl GitPanel {
         )
     }
 
+    pub(super) fn fork_handle_font_size_action(
+        &mut self,
+        persist: bool,
+        delta: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !Self::fork_is_vscode_layout(cx) {
+            return false;
+        }
+
+        let rem_size = window.rem_size();
+        if persist {
+            update_settings_file(self.fs.clone(), cx, move |settings, cx| {
+                // Resolve inside the queued update so repeated shortcuts build on each other.
+                let font_size = fork_commit_editor_font_size(rem_size, cx) + delta;
+                settings.theme.git_commit_buffer_font_size =
+                    Some(f32::from(theme_settings::clamp_font_size(font_size)).into());
+            });
+        } else {
+            let font_size = fork_commit_editor_font_size(rem_size, cx) + delta;
+            theme_settings::adjust_git_commit_buffer_font_size(cx, |_| font_size);
+        }
+        true
+    }
+
     fn fork_render_commit_area(
         &self,
         window: &mut Window,
@@ -618,7 +678,7 @@ impl GitPanel {
         let editor_focused = self.commit_editor.focus_handle(cx).is_focused(window);
 
         let theme_settings = ThemeSettings::get_global(cx);
-        let font_size = theme_settings.ui_font_size(cx);
+        let font_size = fork_commit_editor_font_size(window.rem_size(), cx);
         let editor_style = EditorStyle {
             background: colors.editor_background,
             local_player: cx.theme().players().local(),
@@ -1997,6 +2057,184 @@ mod tests {
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         cx.run_until_parked();
         (workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_commit_editor_font_size_matches_ui_labels(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, _, mut cx) = panel_with_one_commit(cx).await;
+        cx.update(|window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.ui_font_size = Some(16.0.into());
+                    settings.theme.buffer_font_size = Some(32.0.into());
+                    settings.theme.git_commit_buffer_font_size = None;
+                });
+            });
+            theme_settings::setup_ui_font(window, cx);
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(14.));
+
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.ui_font_size = Some(20.0.into());
+                });
+            });
+            theme_settings::setup_ui_font(window, cx);
+            assert_eq!(
+                fork_commit_editor_font_size(window.rem_size(), cx),
+                TextSize::Default.rems(cx).to_pixels(window.rem_size()),
+            );
+            assert_eq!(
+                fork_commit_editor_font_size(window.rem_size(), cx),
+                px(17.5)
+            );
+
+            theme_settings::adjust_ui_font_size(cx, |_| px(24.));
+            theme_settings::setup_ui_font(window, cx);
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(21.));
+
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.git_commit_buffer_font_size = Some(19.0.into());
+                });
+            });
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(19.));
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.git_commit_buffer_font_size = Some(12.0.into());
+                });
+            });
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(12.));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_commit_editor_temporary_font_size_actions(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, panel, mut cx) = panel_with_one_commit(cx).await;
+        cx.update(|window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.ui_font_size = Some(16.0.into());
+                    settings.theme.buffer_font_size = Some(32.0.into());
+                    settings.theme.git_commit_buffer_font_size = None;
+                });
+            });
+            theme_settings::setup_ui_font(window, cx);
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.increase_font_size(&IncreaseBufferFontSize { persist: false }, window, cx);
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(15.));
+            panel.increase_font_size(&IncreaseBufferFontSize { persist: false }, window, cx);
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(16.));
+            panel.decrease_font_size(&DecreaseBufferFontSize { persist: false }, window, cx);
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(15.));
+            assert_eq!(
+                cx.global::<SettingsStore>()
+                    .raw_user_settings()
+                    .and_then(|settings| settings.content.theme.git_commit_buffer_font_size),
+                None,
+            );
+
+            panel.handle_font_size_action(false, px(1000.), window, cx);
+            assert_eq!(
+                fork_commit_editor_font_size(window.rem_size(), cx),
+                theme_settings::clamp_font_size(px(1015.)),
+            );
+            panel.handle_font_size_action(false, px(-1000.), window, cx);
+            assert_eq!(
+                fork_commit_editor_font_size(window.rem_size(), cx),
+                theme_settings::clamp_font_size(px(-1000.)),
+            );
+            panel.reset_font_size(&ResetBufferFontSize { persist: false }, window, cx);
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(14.));
+        });
+
+        set_layout(ForkGitPanelLayout::Tabs, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.increase_font_size(&IncreaseBufferFontSize { persist: false }, window, cx);
+            assert_eq!(
+                ThemeSettings::get_global(cx).git_commit_buffer_font_size(cx),
+                px(13.)
+            );
+        });
+        set_layout(ForkGitPanelLayout::Vscode, &mut cx);
+        cx.update(|window, cx| {
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(13.));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_commit_editor_persisted_font_size_actions(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, panel, mut cx) = panel_with_one_commit(cx).await;
+        let fs = panel.read_with(&cx, |panel, _| panel.fs.clone());
+        let initialize_settings = cx.update(|_, cx| {
+            settings::update_settings_file_with_completion(fs.clone(), cx, |settings, _| {
+                settings
+                    .fork
+                    .get_or_insert_default()
+                    .git_panel
+                    .get_or_insert_default()
+                    .layout = Some(ForkGitPanelLayout::Vscode);
+                settings.theme.ui_font_size = Some(16.0.into());
+                settings.theme.buffer_font_size = Some(32.0.into());
+                settings.theme.git_commit_buffer_font_size = None;
+            })
+        });
+        let initialize_result = initialize_settings.await;
+        assert!(
+            matches!(initialize_result, Ok(Ok(()))),
+            "{initialize_result:?}"
+        );
+        cx.update(|window, cx| {
+            theme_settings::setup_ui_font(window, cx);
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.increase_font_size(&IncreaseBufferFontSize { persist: true }, window, cx);
+            panel.increase_font_size(&IncreaseBufferFontSize { persist: true }, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(16.));
+            assert_eq!(
+                ThemeSettings::get_global(cx).git_commit_buffer_font_size_settings(),
+                Some(px(16.)),
+            );
+        });
+        let saved_settings = SettingsStore::load_settings(&fs)
+            .await
+            .and_then(|text| settings::parse_json_with_comments::<serde_json::Value>(&text));
+        assert!(
+            saved_settings.as_ref().is_ok_and(|settings| {
+                settings
+                    .get("git_commit_buffer_font_size")
+                    .and_then(|size| size.as_f64())
+                    == Some(16.0)
+            }),
+            "{saved_settings:?}",
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.decrease_font_size(&DecreaseBufferFontSize { persist: true }, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(15.));
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.reset_font_size(&ResetBufferFontSize { persist: true }, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(fork_commit_editor_font_size(window.rem_size(), cx), px(14.));
+            assert_eq!(
+                cx.global::<SettingsStore>()
+                    .raw_user_settings()
+                    .and_then(|settings| settings.content.theme.git_commit_buffer_font_size),
+                None,
+            );
+        });
     }
 
     fn history_len(panel: &GitPanel) -> Option<usize> {
