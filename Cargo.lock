@@ -6550,11 +6550,13 @@ dependencies = [
  "editor",
  "fork_copy_anchor",
  "fork_json_explorer",
+ "fork_window_switcher",
  "fork_windsurf",
  "gpui",
  "language",
  "log",
  "release_channel",
+ "remote_connection",
  "semver",
  "settings",
  "theme",
@@ -6600,6 +6602,25 @@ dependencies = [
  "settings",
  "theme",
  "theme_settings",
+]
+
+[[package]]
+name = "fork_window_switcher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "fuzzy_nucleo",
+ "gpui",
+ "menu",
+ "picker",
+ "project",
+ "remote",
+ "remote_connection",
+ "serde_json",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]

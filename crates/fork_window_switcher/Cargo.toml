@@ -1,0 +1,33 @@
+[package]
+name = "fork_window_switcher"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fork_window_switcher.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+fuzzy_nucleo.workspace = true
+gpui.workspace = true
+picker.workspace = true
+project.workspace = true
+remote_connection.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+editor.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+menu.workspace = true
+remote = { workspace = true, features = ["test-support"] }
+remote_connection = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

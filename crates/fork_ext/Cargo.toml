@@ -17,6 +17,7 @@ editor.workspace = true
 fork_copy_anchor.workspace = true
 fork_json_explorer.workspace = true
 fork_windsurf.workspace = true
+fork_window_switcher.workspace = true
 gpui.workspace = true
 log.workspace = true
 settings.workspace = true
@@ -29,6 +30,7 @@ editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 language = { workspace = true, features = ["test-support"] }
 release_channel.workspace = true
+remote_connection = { workspace = true, features = ["test-support"] }
 semver.workspace = true
 settings = { workspace = true, features = ["test-support"] }
 theme = { workspace = true, features = ["test-support"] }

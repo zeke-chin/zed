@@ -8,7 +8,7 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 
 | # | 文件 | 改动 | 原因 |
 |---|---|---|---|
-| H1 | `Cargo.toml` | `members` 和 `[workspace.dependencies]` 各加 4 个 `fork_` crate | 让自有 crate 进入 workspace |
+| H1 | `Cargo.toml` | `members` 和 `[workspace.dependencies]` 各登记 `fork_` crate（含 `fork_window_switcher`） | 让自有 crate 进入 workspace |
 | H2 | `crates/zed/Cargo.toml` | 加 `fork_ext.workspace = true` | `zed` 是唯一依赖 `fork_ext` 的上游 crate |
 | H3 | `crates/zed/src/main.rs` | `edit_prediction_registry::init` 之后调用 `fork_ext::init(app_state.clone(), cx)` | fork 功能的总入口 |
 | H4 | `crates/zed/src/zed/edit_prediction_registry.rs` | `assign_edit_prediction_provider` 开头：`fork_ext::assign_edit_prediction_provider` 返回 `true` 时提前返回 | fork 的编辑预测 provider 优先于官方设置，见设计文档 5.1 |
