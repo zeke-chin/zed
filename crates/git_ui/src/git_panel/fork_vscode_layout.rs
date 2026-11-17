@@ -28,6 +28,29 @@ const COMMIT_EDITOR_MAX_LINES: usize = 10;
 /// Wider graphs are clipped so the commit subjects stay readable.
 const MAX_GRAPH_LANES: usize = 6;
 const MAX_REF_BADGES: usize = 2;
+/// Hover group of a changes list row, so its inline actions show on hover.
+pub(super) const FORK_ENTRY_GROUP: &str = "fork-git-entry";
+
+/// Hook in `GitPanelSettings::from_settings`: VS Code splits the changes into
+/// "Staged Changes" and "Changes", so the file status grouping becomes the
+/// staging one. Applied to the setting itself so the project diff orders its
+/// files the same way.
+pub(crate) fn fork_group_by(
+    content: &SettingsContent,
+    group_by: GitPanelGroupBy,
+) -> GitPanelGroupBy {
+    let is_vscode_layout = content
+        .fork
+        .as_ref()
+        .and_then(|fork| fork.git_panel.as_ref())
+        .and_then(|git_panel| git_panel.layout)
+        == Some(ForkGitPanelLayout::Vscode);
+    if is_vscode_layout && group_by == GitPanelGroupBy::Status {
+        GitPanelGroupBy::Staging
+    } else {
+        group_by
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, RegisterSetting)]
 pub struct ForkGitPanelLayoutSettings {
@@ -63,6 +86,10 @@ pub(super) struct LayoutState {
     history_height: Option<Pixels>,
     graph: Option<GraphCache>,
     _settings_subscription: Subscription,
+    _window_activation_subscription: Subscription,
+    /// Set on the first render: the panel's focus handle doesn't exist yet
+    /// when this state is built.
+    focus_in_subscription: Option<Subscription>,
 }
 
 #[derive(Clone)]
@@ -85,12 +112,22 @@ impl LayoutState {
                     panel.fork_layout_changed(window, cx);
                 }
             });
+        // VS Code refreshes the status when its window comes back into focus,
+        // which picks up commands run in a terminal in the meantime.
+        let window_activation_subscription =
+            cx.observe_window_activation(window, |panel, window, cx| {
+                if window.is_window_active() {
+                    panel.fork_rescan_repository(cx);
+                }
+            });
         Self {
             changes_collapsed: false,
             history_collapsed: false,
             history_height: None,
             graph: None,
             _settings_subscription: settings_subscription,
+            _window_activation_subscription: window_activation_subscription,
+            focus_in_subscription: None,
         }
     }
 }
@@ -153,6 +190,16 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// Re-reads the repository status. File events miss index changes when
+    /// `.git` is a symlink to a directory outside the worktree, so the panel
+    /// also refreshes after its own git operations, on window focus and from
+    /// the refresh button, like VS Code.
+    pub(super) fn fork_rescan_repository(&self, cx: &mut Context<Self>) {
+        if let Some(repository) = self.active_repository.clone() {
+            repository.update(cx, |repository, cx| repository.fork_rescan(cx));
+        }
+    }
+
     fn fork_unload_commit_history(&mut self, cx: &mut Context<Self>) {
         self.set_commit_history(CommitHistory::Loading, cx);
         self._repo_subscriptions.clear();
@@ -195,6 +242,15 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let has_write_access = self.has_write_access(cx);
+        if self.fork_layout.focus_in_subscription.is_none() {
+            // Switching to the panel or clicking into it refreshes the status,
+            // which picks up git commands run in Zed's own terminal.
+            let focus_handle = self.focus_handle.clone();
+            self.fork_layout.focus_in_subscription =
+                Some(cx.on_focus_in(&focus_handle, window, |panel, _window, cx| {
+                    panel.fork_rescan_repository(cx);
+                }));
+        }
         self.fork_sync_commit_editor_mode(cx);
         self.fork_sync_graph(cx);
         let commit_editor_expanded = self.commit_editor_expanded;
@@ -460,6 +516,12 @@ impl GitPanel {
                         })),
                 )
                 .child(self.render_view_options_menu("fork-view-options-menu"))
+                .child(
+                    IconButton::new("fork-refresh-status", IconName::RotateCw)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Refresh"))
+                        .on_click(cx.listener(|this, _, _, cx| this.fork_rescan_repository(cx))),
+                )
                 .when(!is_branch_mode, |this| {
                     this.child(self.render_git_changes_actions_button(cx))
                 })
@@ -1076,6 +1138,420 @@ impl GitPanel {
     }
 }
 
+/// Inline actions of the changes list, like VS Code's source control view:
+/// group headers and rows get icon buttons that show on hover, followed by
+/// the file count or the status letter.
+impl GitPanel {
+    /// Hook in `render_list_header`.
+    pub(super) fn fork_section_title(section: Section, cx: &App) -> Option<&'static str> {
+        if !Self::fork_is_vscode_layout(cx) {
+            return None;
+        }
+        match section {
+            Section::Conflict => Some("Merge Changes"),
+            Section::Staged => Some("Staged Changes"),
+            Section::Tracked | Section::Unstaged => Some("Changes"),
+            Section::New => Some("Untracked Changes"),
+            Section::Branch => None,
+        }
+    }
+
+    /// Hook in `render_list_header`.
+    pub(super) fn fork_render_header_actions(
+        &self,
+        section: Section,
+        file_count: usize,
+        section_is_empty: bool,
+        has_write_access: bool,
+        all_conflicts_resolved: bool,
+        group_name: SharedString,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if !Self::fork_is_vscode_layout(cx) || self.is_branch_mode() {
+            return None;
+        }
+        let read_only = !has_write_access;
+        let stage = match section {
+            Section::Staged => Some(false),
+            Section::Unstaged => Some(true),
+            Section::Conflict if all_conflicts_resolved => None,
+            Section::Conflict => Some(true),
+            Section::Tracked | Section::New => Some(!self.header_state(section).selected()),
+            Section::Branch => None,
+        };
+        let view_title = match section {
+            Section::Tracked => Some("Open Changes"),
+            Section::Unstaged => Some("Open Unstaged Changes"),
+            Section::Staged => Some("Open Staged Changes"),
+            Section::New | Section::Conflict | Section::Branch => None,
+        };
+        let can_stash = matches!(section, Section::Tracked | Section::Unstaged);
+        let discard_title = match section {
+            Section::Tracked | Section::Unstaged => Some("Discard All Changes"),
+            Section::New => Some("Trash All Untracked Files"),
+            Section::Staged | Section::Conflict | Section::Branch => None,
+        };
+        let id = |name: &str| SharedString::from(format!("fork-header-{name}-{section:?}"));
+
+        let actions = h_flex()
+            .flex_none()
+            .gap_0p5()
+            .visible_on_hover(group_name)
+            .when(can_stash, |this| {
+                this.child(fork_inline_button(
+                    id("stash"),
+                    IconName::Download,
+                    "Stash All Changes",
+                    read_only,
+                    cx,
+                    |this, window, cx| this.stash_all(&StashAll, window, cx),
+                ))
+            })
+            .when_some(view_title, |this, title| {
+                this.child(fork_inline_button(
+                    id("view"),
+                    IconName::FileDiff,
+                    title,
+                    false,
+                    cx,
+                    move |this, window, cx| this.fork_open_section_diff(section, window, cx),
+                ))
+            })
+            .when_some(discard_title, |this, title| {
+                this.child(fork_inline_button(
+                    id("discard"),
+                    IconName::Undo,
+                    title,
+                    read_only,
+                    cx,
+                    move |this, window, cx| this.fork_discard_section(section, window, cx),
+                ))
+            })
+            .when_some(stage, |this, stage| {
+                let (icon, title, intent) = if stage {
+                    (IconName::Plus, "Stage All Changes", StageIntent::Stage)
+                } else {
+                    (IconName::Dash, "Unstage All Changes", StageIntent::Unstage)
+                };
+                this.child(fork_inline_button(
+                    id("stage"),
+                    icon,
+                    title,
+                    read_only,
+                    cx,
+                    move |this, window, cx| {
+                        this.toggle_staged_for_entry(
+                            &GitListEntry::Header(GitHeaderEntry { header: section }),
+                            intent,
+                            window,
+                            cx,
+                        )
+                    },
+                ))
+            });
+
+        Some(
+            h_flex()
+                .flex_none()
+                .gap_1()
+                .when(!section_is_empty, |this| this.child(actions))
+                // VS Code keeps showing "0" on the group a file just left.
+                .when(
+                    file_count > 0 || matches!(section, Section::Staged | Section::Unstaged),
+                    |this| this.child(fork_count_badge(file_count, cx)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Hook in `render_status_entry`. The diff stat goes in front of the
+    /// actions so it stays where it is when they appear.
+    pub(super) fn fork_render_status_actions(
+        &self,
+        ix: usize,
+        entry: &GitStatusEntry,
+        selected: bool,
+        has_write_access: bool,
+        repo: &Repository,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if !Self::fork_is_vscode_layout(cx) || self.is_branch_mode() {
+            return None;
+        }
+        let read_only = !has_write_access;
+        let status = entry.status;
+        let stage_status = GitPanel::stage_status_for_entry(entry, repo);
+        let stage = self
+            .stage_intent_for_entry_index(ix)
+            .resolve_with(|| stage_status);
+        // Unstaging a resolved conflict would drop its merge stages, so the
+        // upstream checkbox is locked too.
+        let can_toggle_stage = !self.is_resolved_conflict(ix, cx);
+        let discard_title = if status.is_deleted() {
+            "Restore File"
+        } else if status.is_created() && !status.staging().has_staged() {
+            "Trash File"
+        } else {
+            "Discard Changes"
+        };
+        let id = |name: &str| SharedString::from(format!("fork-entry-{name}-{ix}"));
+
+        let actions = h_flex()
+            .flex_none()
+            .gap_0p5()
+            .when(!selected, |this| this.visible_on_hover(FORK_ENTRY_GROUP))
+            .when(!status.is_deleted(), |this| {
+                this.child(fork_inline_button_from_path(
+                    id("open"),
+                    "icons/fork/go_to_file.svg",
+                    "Open File",
+                    false,
+                    cx,
+                    move |this, window, cx| {
+                        this.fork_select_for_inline_action(ix);
+                        this.view_file(&Default::default(), window, cx);
+                    },
+                ))
+            })
+            .child(fork_inline_button(
+                id("discard"),
+                IconName::Undo,
+                discard_title,
+                read_only,
+                cx,
+                move |this, window, cx| {
+                    this.fork_select_for_inline_action(ix);
+                    this.revert_selected(&RestoreFile::default(), window, cx);
+                },
+            ))
+            .when(can_toggle_stage, |this| {
+                this.child(fork_stage_button(id("stage"), ix, stage, read_only, cx))
+            });
+
+        let diff_stat = GitPanelSettings::get_global(cx)
+            .diff_stats
+            .then_some(entry.diff_stat)
+            .flatten();
+
+        Some(
+            h_flex()
+                .flex_none()
+                .gap_1()
+                .when_some(diff_stat, |this, stat| {
+                    this.child(ui::DiffStat::new(
+                        id("diff-stat"),
+                        stat.added as usize,
+                        stat.deleted as usize,
+                    ))
+                })
+                .child(actions)
+                .child(fork_status_letter(status))
+                .into_any_element(),
+        )
+    }
+
+    /// Hook in `render_directory_entry`.
+    pub(super) fn fork_render_directory_actions(
+        &self,
+        ix: usize,
+        entry: &GitTreeDirEntry,
+        selected: bool,
+        stage_status: StageStatus,
+        has_write_access: bool,
+        resolved_conflict: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if !Self::fork_is_vscode_layout(cx) || self.is_branch_mode() {
+            return None;
+        }
+        let read_only = !has_write_access;
+        let stage = StageIntent::for_section(entry.key.section).resolve_with(|| stage_status);
+        let id = |name: &str| SharedString::from(format!("fork-dir-{name}-{ix}"));
+
+        Some(
+            h_flex()
+                .flex_none()
+                .gap_0p5()
+                .when(!selected, |this| this.visible_on_hover(FORK_ENTRY_GROUP))
+                .child(fork_inline_button(
+                    id("discard"),
+                    IconName::Undo,
+                    "Discard Changes",
+                    read_only,
+                    cx,
+                    move |this, window, cx| {
+                        this.fork_select_for_inline_action(ix);
+                        this.revert_selected(&RestoreFile::default(), window, cx);
+                    },
+                ))
+                .when(!resolved_conflict, |this| {
+                    this.child(fork_stage_button(id("stage"), ix, stage, read_only, cx))
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// Inline row actions act on the clicked row, or on the whole selection
+    /// when the row is part of it, the same way the context menu does.
+    fn fork_select_for_inline_action(&mut self, ix: usize) {
+        if !self.row_is_marked(ix) {
+            self.clear_marks();
+        }
+        self.selected_entry = Some(ix);
+    }
+
+    fn fork_open_section_diff(
+        &mut self,
+        section: Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace
+            .update(cx, |workspace, cx| match section {
+                Section::Staged => StagedDiff::deploy_at(workspace, None, window, cx),
+                Section::Unstaged => UnstagedDiff::deploy_at(workspace, None, window, cx),
+                _ => ProjectDiff::deploy_at(workspace, None, window, cx),
+            })
+            .log_err();
+    }
+
+    fn fork_discard_section(
+        &mut self,
+        section: Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        // The "Unstaged" group only owns the working tree half of a partially
+        // staged file.
+        let scope = if section == Section::Unstaged {
+            DiscardScope::Unstaged
+        } else {
+            DiscardScope::All
+        };
+        let header = GitHeaderEntry { header: section };
+        let targets = {
+            let repository = repository.read(cx);
+            self.change_entries
+                .iter()
+                .filter(|entry| header.contains(entry, repository))
+                .map(|entry| DiscardTarget::new(entry.clone(), scope))
+                .collect::<Vec<_>>()
+        };
+        self.revert_entries(targets, false, window, cx);
+    }
+}
+
+fn fork_stage_button(
+    id: SharedString,
+    ix: usize,
+    stage: bool,
+    disabled: bool,
+    cx: &Context<GitPanel>,
+) -> IconButton {
+    let (icon, title) = if stage {
+        (IconName::Plus, "Stage Changes")
+    } else {
+        (IconName::Dash, "Unstage Changes")
+    };
+    fork_inline_button(id, icon, title, disabled, cx, move |this, window, cx| {
+        this.fork_select_for_inline_action(ix);
+        if stage {
+            this.stage_selected(&git::StageFile, window, cx);
+        } else {
+            this.unstage_selected(&git::UnstageFile, window, cx);
+        }
+    })
+}
+
+/// The buttons sit inside clickable rows and headers, so they stop the click
+/// from also opening the file or collapsing the group.
+fn fork_inline_button(
+    id: SharedString,
+    icon: IconName,
+    tooltip: &'static str,
+    disabled: bool,
+    cx: &Context<GitPanel>,
+    handler: impl Fn(&mut GitPanel, &mut Window, &mut Context<GitPanel>) + 'static,
+) -> IconButton {
+    IconButton::new(id, icon)
+        .icon_size(IconSize::Small)
+        .disabled(disabled)
+        .tooltip(Tooltip::text(tooltip))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            handler(this, window, cx);
+        }))
+}
+
+/// Same as [`fork_inline_button`] for icons that aren't in `IconName`.
+fn fork_inline_button_from_path(
+    id: SharedString,
+    icon_path: &'static str,
+    tooltip: &'static str,
+    disabled: bool,
+    cx: &Context<GitPanel>,
+    handler: impl Fn(&mut GitPanel, &mut Window, &mut Context<GitPanel>) + 'static,
+) -> ButtonLike {
+    ButtonLike::new(id)
+        .style(ButtonStyle::Subtle)
+        .size(ButtonSize::None)
+        .disabled(disabled)
+        .child(
+            h_flex()
+                .p_0p5()
+                .child(
+                    Icon::from_path(icon_path)
+                        .size(IconSize::Small)
+                        .color(if disabled {
+                            Color::Disabled
+                        } else {
+                            Color::Muted
+                        }),
+                ),
+        )
+        .tooltip(Tooltip::text(tooltip))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            handler(this, window, cx);
+        }))
+}
+
+fn fork_count_badge(count: usize, cx: &App) -> impl IntoElement {
+    h_flex()
+        .flex_none()
+        .h(px(16.))
+        .min_w(px(16.))
+        .px_1()
+        .justify_center()
+        .rounded_full()
+        .bg(cx.theme().colors().element_background)
+        .child(Label::new(count.to_string()).size(LabelSize::XSmall))
+}
+
+/// VS Code's one-letter status decoration.
+fn fork_status_letter(status: FileStatus) -> impl IntoElement {
+    let (letter, color) = if status.is_conflicted() {
+        ("!", Color::VersionControlConflict)
+    } else if status.is_untracked() {
+        ("U", Color::VersionControlAdded)
+    } else if status.is_created() {
+        ("A", Color::VersionControlAdded)
+    } else if status.is_deleted() {
+        ("D", Color::VersionControlDeleted)
+    } else {
+        ("M", Color::VersionControlModified)
+    };
+    h_flex().flex_none().w(px(14.)).justify_center().child(
+        Label::new(letter)
+            .size(LabelSize::Small)
+            .weight(FontWeight::SEMIBOLD)
+            .color(color),
+    )
+}
+
 /// Branch, remote and tag badges at the end of a history row, like VS Code's
 /// graph: the checked-out branch first, a remote that points at the same
 /// commit as a local branch collapses into a small cloud icon.
@@ -1351,6 +1827,75 @@ mod tests {
             CommitHistory::Loaded(entries) => Some(entries.len()),
             CommitHistory::Loading | CommitHistory::Error(_) => None,
         }
+    }
+
+    #[gpui::test]
+    async fn test_vscode_layout_groups_changes_by_staging_state(cx: &mut TestAppContext) {
+        use git::status::StatusCode;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "staged": "staged\n", "unstaged": "unstaged\n" }),
+        )
+        .await;
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("staged", StatusCode::Modified.index()),
+                ("unstaged", StatusCode::Modified.worktree()),
+            ],
+        );
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+
+        // The default "status" grouping still splits staged and unstaged
+        // files, like VS Code.
+        set_layout(ForkGitPanelLayout::Vscode, &mut cx);
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.run_until_parked();
+
+        let sections = |panel: &GitPanel| {
+            panel
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    let path = entry.status_entry()?.repo_path.as_unix_str().to_string();
+                    Some((panel.section_for_entry_index(index)?, path))
+                })
+                .collect::<Vec<_>>()
+        };
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                sections(panel),
+                vec![
+                    (Section::Staged, "staged".to_string()),
+                    (Section::Unstaged, "unstaged".to_string()),
+                ]
+            );
+        });
+
+        set_layout(ForkGitPanelLayout::Tabs, &mut cx);
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                sections(panel)
+                    .iter()
+                    .all(|(section, _)| *section == Section::Tracked),
+                "{:?}",
+                sections(panel)
+            );
+        });
     }
 
     #[gpui::test]
