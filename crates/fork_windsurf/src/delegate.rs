@@ -21,17 +21,21 @@ use edit_prediction_types::{
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EntityId, SharedString, Task, WeakEntity,
 };
-use language::{Anchor, Buffer, BufferSnapshot, EditPreview, ToOffset as _};
+use language::{
+    Anchor, Bias, Buffer, BufferSnapshot, EditPreview, PointUtf16, ToOffset as _, Unclipped,
+};
 use project::Project;
 use ui::IconName;
 
 use crate::{
-    Preparation, PreparedRequest, RequestOutcome, Windsurf, WindsurfSettings,
+    PendingJump, Preparation, PreparedRequest, RequestOutcome, Windsurf, WindsurfSettings,
     context::SelectionWindow,
     diff::{PredictionError, prediction_edits},
     feedback::{DocumentInfo, PredictionRecord, row_and_column},
+    language_server::request::{line_range_bytes, trigger_condition},
     native::get_tab::TabStream,
     prefetch::{Prefetch, PrefetchUse, apply_edits},
+    proto::exa::codeium_common_pb::SupercompleteTriggerCondition,
     tab_jump::{self, JumpOrigin},
 };
 use settings::Settings as _;
@@ -74,10 +78,23 @@ pub(crate) struct ResponseForBuffer {
     pub from_cache: bool,
 }
 
+/// A Tab Jump from the language server: only a position, the edit there
+/// comes from the request that arriving at it triggers (`TAB_JUMP_ACCEPT`).
+#[derive(Clone)]
+pub(crate) struct LanguageServerJump {
+    pub id: SharedString,
+    /// The buffer and version the jump was predicted for.
+    pub origin: Entity<Buffer>,
+    pub origin_version: clock::Global,
+    pub target_buffer: Entity<Buffer>,
+    pub target: Anchor,
+}
+
 pub struct WindsurfDelegate {
     pub(crate) windsurf: Entity<Windsurf>,
     pub(crate) pending_request: Option<(u64, Task<()>)>,
     pub(crate) current: Option<CurrentPrediction>,
+    pub(crate) language_server_jump: Option<LanguageServerJump>,
     /// The buffer as of the last `suggest`, which is the state just before
     /// an accepted prediction gets applied.
     last_suggested: Option<(EntityId, BufferSnapshot)>,
@@ -94,6 +111,7 @@ impl WindsurfDelegate {
             windsurf,
             pending_request: None,
             current: None,
+            language_server_jump: None,
             last_suggested: None,
             prefetch: None,
             next_prefetch_generation: 0,
@@ -126,6 +144,7 @@ impl WindsurfDelegate {
         buffer: Entity<Buffer>,
         cursor: Anchor,
         debounce: Duration,
+        trigger: SupercompleteTriggerCondition,
         cx: &mut Context<Self>,
     ) {
         self.cancel_pending_request(cx);
@@ -136,8 +155,10 @@ impl WindsurfDelegate {
             .update(cx, |windsurf, _| windsurf.next_request_id());
         let windsurf = self.windsurf.clone();
         let task = cx.spawn(async move |this, cx| {
-            if let Err(error) =
-                Self::run_request(this, windsurf, buffer, cursor, request_id, debounce, cx).await
+            if let Err(error) = Self::run_request(
+                this, windsurf, buffer, cursor, request_id, debounce, trigger, cx,
+            )
+            .await
             {
                 log::debug!("windsurf: request {request_id} ended early: {error:#}");
             }
@@ -145,6 +166,7 @@ impl WindsurfDelegate {
         self.pending_request = Some((request_id, task));
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_request(
         this: gpui::WeakEntity<Self>,
         windsurf: Entity<Windsurf>,
@@ -152,6 +174,7 @@ impl WindsurfDelegate {
         cursor: Anchor,
         request_id: u64,
         debounce: Duration,
+        trigger: SupercompleteTriggerCondition,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<()> {
         if !debounce.is_zero() {
@@ -160,7 +183,7 @@ impl WindsurfDelegate {
         let trigger_id = uuid::Uuid::new_v4().to_string();
         loop {
             let preparation = windsurf.update(cx, |windsurf, cx| {
-                windsurf.prepare_request(request_id, &buffer, cursor, &trigger_id, cx)
+                windsurf.prepare_request(request_id, &buffer, cursor, &trigger_id, trigger, cx)
             });
             let (prepared, snapshot) = match preparation {
                 Preparation::Send(prepared, snapshot) => (prepared, snapshot),
@@ -195,7 +218,40 @@ impl WindsurfDelegate {
             let exchange = cx.background_spawn(backend.get_tab(api_key, input)).await;
 
             let retry_at = match &exchange.result {
+                Ok(stream) if stream.tab_jump && stream.jump_position.is_some() => {
+                    let jump =
+                        language_server_jump(&this, &buffer, &snapshot, stream, request_id, cx)
+                            .await;
+                    let outcome = match &jump {
+                        Some(_) => RequestOutcome::TabJump,
+                        None => RequestOutcome::Discarded("the Tab Jump target isn't available"),
+                    };
+                    windsurf.update(cx, |windsurf, cx| {
+                        windsurf.finish_request(request_id, &details, &exchange, outcome, cx);
+                        windsurf.set_pending_jump(jump.as_ref().map(|jump| PendingJump {
+                            buffer: jump.target_buffer.downgrade(),
+                            target: jump.target,
+                            completion_id: stream.completion_id.clone(),
+                            prompt_id: stream.prompt_id.clone(),
+                            shown_at: cx.background_executor().now(),
+                        }));
+                    });
+                    this.update(cx, |this, cx| {
+                        this.finish_pending(request_id);
+                        this.current = None;
+                        this.language_server_jump = jump;
+                        cx.notify();
+                    })?;
+                    return Ok(());
+                }
                 Ok(stream) => {
+                    // The language server rewrites whole lines of its own choosing.
+                    let window = match stream.line_range {
+                        Some((start_line, end_line)) => {
+                            line_window(&snapshot, start_line, end_line).unwrap_or(window)
+                        }
+                        None => window,
+                    };
                     let prediction =
                         prepare_prediction(&buffer, &snapshot, &window, stream, &abs_path, cx)
                             .await;
@@ -211,11 +267,15 @@ impl WindsurfDelegate {
                         stream: stream.clone(),
                         window,
                         abs_path,
-                        prompt_id: exchange
-                            .request
-                            .as_ref()
-                            .map(|request| request.prompt_id.clone())
-                            .unwrap_or_default(),
+                        prompt_id: if stream.prompt_id.is_empty() {
+                            exchange
+                                .request
+                                .as_ref()
+                                .map(|request| request.prompt_id.clone())
+                                .unwrap_or_default()
+                        } else {
+                            stream.prompt_id.clone()
+                        },
                         document: details.document.clone(),
                         from_cache: false,
                     };
@@ -229,6 +289,7 @@ impl WindsurfDelegate {
                     };
                     this.update(cx, |this, cx| {
                         this.finish_pending(request_id);
+                        this.language_server_jump = None;
                         if let Ok(Some((edits, edit_preview))) = prediction {
                             this.install(
                                 &buffer,
@@ -292,7 +353,8 @@ impl WindsurfDelegate {
             .as_ref()
             .map(|(text, cursor)| row_and_column(text, *cursor))
             .unwrap_or_default();
-        let record = PredictionRecord::new(
+        let completion_id = response.stream.completion_id.clone();
+        let mut record = PredictionRecord::new(
             response.prompt_id,
             &response.document,
             &response.window,
@@ -301,6 +363,9 @@ impl WindsurfDelegate {
             cursor_position,
             response.from_cache,
         );
+        if !completion_id.is_empty() {
+            record.completion_id = completion_id;
+        }
         self.current = Some(CurrentPrediction {
             id: SharedString::from(format!("windsurf-{request_id}")),
             buffer: buffer.clone(),
@@ -324,6 +389,63 @@ impl WindsurfDelegate {
         {
             self.pending_request = None;
         }
+    }
+
+    /// `Some` when the language server's Tab Jump decides what to show: the
+    /// jump itself while the origin buffer is unchanged, or nothing once the
+    /// cursor arrived at the target, which requests the edit there.
+    fn suggest_language_server_jump(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cursor: Anchor,
+        cx: &mut Context<Self>,
+    ) -> Option<Option<EditPrediction>> {
+        let landed = self.windsurf.update(cx, |windsurf, cx| {
+            windsurf.take_landed_jump(buffer, cursor, cx)
+        });
+        if let Some(landed) = landed {
+            self.language_server_jump = None;
+            self.current = None;
+            let delay = cx
+                .background_executor()
+                .now()
+                .saturating_duration_since(landed.shown_at);
+            self.windsurf.update(cx, |windsurf, cx| {
+                windsurf.report_language_server_feedback(
+                    &landed.completion_id,
+                    &landed.prompt_id,
+                    true,
+                    delay,
+                    buffer,
+                    cx,
+                )
+            });
+            self.start_request(
+                buffer.clone(),
+                cursor,
+                Duration::ZERO,
+                SupercompleteTriggerCondition::TabJumpAccept,
+                cx,
+            );
+            return Some(None);
+        }
+        let jump = self.language_server_jump.as_ref()?;
+        if &jump.origin != buffer {
+            return None;
+        }
+        // Another editor took the jump when it landed there.
+        let still_pending = self.windsurf.read(cx).pending_jump.is_some();
+        if buffer.read(cx).version() != jump.origin_version || !still_pending {
+            self.language_server_jump = None;
+            self.windsurf
+                .update(cx, |windsurf, _| windsurf.set_pending_jump(None));
+            return None;
+        }
+        Some(Some(EditPrediction::Jump {
+            id: Some(jump.id.clone()),
+            snapshot: jump.target_buffer.read(cx).snapshot(),
+            target: jump.target,
+        }))
     }
 
     fn record_feedback(
@@ -356,6 +478,72 @@ impl WindsurfDelegate {
             )
         });
     }
+}
+
+/// The window a language server rewrite covers: lines `[start, end)` of the
+/// document that was sent.
+fn line_window(
+    snapshot: &BufferSnapshot,
+    start_line: u32,
+    end_line: u32,
+) -> Option<SelectionWindow> {
+    let text = snapshot.text();
+    let byte_range = line_range_bytes(&text, start_line, end_line)?;
+    Some(SelectionWindow {
+        text: text[byte_range.clone()].to_string(),
+        start_line,
+        end_line,
+        byte_range,
+    })
+}
+
+/// Resolves the language server's Tab Jump to a buffer position. The column
+/// is in UTF-16 code units, as the official extension passes it straight to
+/// a VS Code `Position`.
+async fn language_server_jump(
+    this: &WeakEntity<WindsurfDelegate>,
+    buffer: &Entity<Buffer>,
+    snapshot: &BufferSnapshot,
+    stream: &TabStream,
+    request_id: u64,
+    cx: &mut AsyncApp,
+) -> Option<LanguageServerJump> {
+    let (row, column) = stream.jump_position?;
+    let same_file = stream.path.is_empty()
+        || buffer.read_with(cx, |buffer, cx| {
+            crate::context::buffer_location(buffer, cx)
+                .is_some_and(|location| location.abs_path.to_string_lossy() == stream.path)
+        });
+    let target_buffer = if same_file {
+        buffer.clone()
+    } else {
+        let project = this.read_with(cx, |this, _| this.project.clone()).ok()??;
+        let open = project
+            .update(cx, |project, cx| {
+                let project_path = project.find_project_path(&stream.path, cx)?;
+                Some(project.open_buffer(project_path, cx))
+            })
+            .ok()??;
+        open.await.ok()?
+    };
+    if &target_buffer == buffer
+        && &buffer.read_with(cx, |buffer, _| buffer.version()) != snapshot.version()
+    {
+        return None;
+    }
+    let target = target_buffer.read_with(cx, |target_buffer, _| {
+        let target_snapshot = target_buffer.snapshot();
+        let point =
+            target_snapshot.clip_point_utf16(Unclipped(PointUtf16::new(row, column)), Bias::Left);
+        target_snapshot.anchor_before(point)
+    });
+    Some(LanguageServerJump {
+        id: SharedString::from(format!("windsurf-ls-jump-{request_id}")),
+        origin: buffer.clone(),
+        origin_version: snapshot.version().clone(),
+        target_buffer,
+        target,
+    })
 }
 
 async fn wait_until(instant: Instant, cx: &mut AsyncApp) {
@@ -491,6 +679,12 @@ impl EditPredictionDelegate for WindsurfDelegate {
             return;
         }
         self.adopt_landing(&buffer, cx);
+        if let Some(jump) = &self.language_server_jump {
+            if jump.origin == buffer && buffer.read(cx).version() == jump.origin_version {
+                return;
+            }
+            self.language_server_jump = None;
+        }
         if let Some(current) = &self.current
             && current.buffer == buffer
             && current.interpolate(&buffer.read(cx).snapshot()).is_some()
@@ -509,11 +703,18 @@ impl EditPredictionDelegate for WindsurfDelegate {
         } else {
             debounce_duration.max(DEBOUNCE)
         };
-        self.start_request(buffer, cursor_position, debounce, cx);
+        self.start_request(
+            buffer,
+            cursor_position,
+            debounce,
+            trigger_condition(trigger),
+            cx,
+        );
     }
 
     fn accept(&mut self, cx: &mut Context<Self>) {
         self.cancel_pending_request(cx);
+        self.language_server_jump = None;
         if let Some(current) = self.current.take() {
             self.record_feedback(current, true, cx);
         }
@@ -521,6 +722,31 @@ impl EditPredictionDelegate for WindsurfDelegate {
 
     fn discard(&mut self, reason: EditPredictionDiscardReason, cx: &mut Context<Self>) {
         self.cancel_pending_request(cx);
+        if let Some(jump) = self.language_server_jump.take() {
+            let pending = self.windsurf.update(cx, |windsurf, _| {
+                let pending = windsurf.pending_jump.clone();
+                windsurf.set_pending_jump(None);
+                pending
+            });
+            if reason == EditPredictionDiscardReason::Rejected
+                && let Some(pending) = pending
+            {
+                let delay = cx
+                    .background_executor()
+                    .now()
+                    .saturating_duration_since(pending.shown_at);
+                self.windsurf.update(cx, |windsurf, cx| {
+                    windsurf.report_language_server_feedback(
+                        &pending.completion_id,
+                        &pending.prompt_id,
+                        false,
+                        delay,
+                        &jump.origin,
+                        cx,
+                    )
+                });
+            }
+        }
         if let Some(current) = self.current.take() {
             tab_jump::clear_landing(&current.id, cx);
             if reason == EditPredictionDiscardReason::Rejected {
@@ -541,10 +767,19 @@ impl EditPredictionDelegate for WindsurfDelegate {
     fn suggest(
         &mut self,
         buffer: &Entity<Buffer>,
-        _cursor_position: Anchor,
+        cursor_position: Anchor,
         cx: &mut Context<Self>,
     ) -> Option<EditPrediction> {
         self.adopt_landing(buffer, cx);
+        if self.windsurf.read(cx).uses_language_server() {
+            if let Some(prediction) = self.suggest_language_server_jump(buffer, cursor_position, cx)
+            {
+                return prediction;
+            }
+            self.windsurf
+                .read(cx)
+                .selection_changed(buffer, cursor_position, cx);
+        }
         let current = self.current.as_ref()?;
         if &current.buffer != buffer {
             let jump = current.jump.as_ref()?;

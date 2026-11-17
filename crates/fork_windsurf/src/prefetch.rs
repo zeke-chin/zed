@@ -24,6 +24,7 @@ use settings::Settings as _;
 use crate::{
     PreparedRequest, RequestOutcome, WindsurfSettings,
     delegate::{ResponseForBuffer, WindsurfDelegate, prepare_prediction},
+    proto::exa::codeium_common_pb::SupercompleteTriggerCondition,
     tab_jump,
 };
 
@@ -190,7 +191,13 @@ impl WindsurfDelegate {
                 // The predictive request failed or the user moved on while
                 // waiting: answer the trigger with a request of its own.
                 self.prefetch = None;
-                self.start_request(buffer, cursor, Duration::ZERO, cx);
+                self.start_request(
+                    buffer,
+                    cursor,
+                    Duration::ZERO,
+                    SupercompleteTriggerCondition::SupercompleteAccept,
+                    cx,
+                );
             }
         }
     }

@@ -135,6 +135,7 @@ fn live_get_tab() {
             cached_hashes: Vec::new(),
             feedback: Vec::new(),
             trigger_id: uuid::Uuid::new_v4().to_string(),
+            language_server: Default::default(),
         };
         let exchange = block_on(backend.get_tab(api_key.clone(), input));
         let stream = match exchange.result {
@@ -251,6 +252,7 @@ fn live_trajectory_cache_and_prediction() {
             cached_hashes,
             feedback: Vec::new(),
             trigger_id: uuid::Uuid::new_v4().to_string(),
+            language_server: Default::default(),
         }
     };
     let report = |label: &str, exchange: &fork_windsurf::backend::TabExchange| {

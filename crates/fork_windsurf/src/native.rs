@@ -173,6 +173,7 @@ impl NativeBackend {
                     first_delta_after: None,
                     request_bytes: 0,
                     resent_full_trajectory: false,
+                    described_request: None,
                 };
             }
         };
@@ -226,6 +227,7 @@ impl NativeBackend {
                 first_delta_after,
                 request_bytes,
                 resent_full_trajectory,
+                described_request: None,
             };
         }
     }

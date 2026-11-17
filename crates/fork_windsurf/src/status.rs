@@ -13,7 +13,11 @@ use ui::{Button, ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
-use crate::{ErrorStatus, ShowLastRequest, Status, Windsurf, WindsurfSettings};
+use crate::{
+    ErrorStatus, RestartLanguageServer, ShowLanguageServerInfo, ShowLastRequest, Status, Windsurf,
+    WindsurfSettings,
+    language_server::{ServerStatus, binary},
+};
 
 const IMPORT_API_KEY_ACTION: &str = "windsurf::ImportApiKey";
 const OPEN_API_KEY_SETTING_ACTION: &str = "windsurf::OpenApiKeySetting";
@@ -61,6 +65,31 @@ pub(crate) fn describe(status: &Status) -> (&'static str, String, Color) {
             "Requesting a prediction".to_string(),
             Color::Muted,
         ),
+        Status::StartingLanguageServer => (
+            "Windsurf: starting…",
+            "Starting the Windsurf language server".to_string(),
+            Color::Muted,
+        ),
+        Status::Error(ErrorStatus::LanguageServerNotFound(message)) => (
+            "Windsurf: language server not found",
+            format!(
+                "{message}. Set `fork.windsurf.language_server_path`, or switch `fork.windsurf.backend` back to \"native\"."
+            ),
+            Color::Error,
+        ),
+        Status::Error(ErrorStatus::LanguageServerFailed { message, retry_in }) => (
+            "Windsurf: language server failed",
+            format!(
+                "The Windsurf language server couldn't start ({message}){}",
+                format_retry(*retry_in)
+            ),
+            Color::Error,
+        ),
+        Status::Error(ErrorStatus::RemoteProject) => (
+            "Windsurf: not in remote projects",
+            "The language server backend only works for local files; use the native backend in remote projects".to_string(),
+            Color::Warning,
+        ),
         Status::Error(ErrorStatus::Unauthenticated(message)) => (
             "Windsurf: key rejected",
             format!("The API key was rejected ({message}). Import it again or enter a new one."),
@@ -100,9 +129,10 @@ impl Render for WindsurfStatusItem {
         let status = windsurf.read(cx).status(cx);
         let (label, tooltip, color) = describe(&status);
         let enabled = WindsurfSettings::get_global(cx).enabled;
+        let uses_language_server = windsurf.read(cx).uses_language_server();
         div().child(
             PopoverMenu::new("windsurf-status-menu")
-                .menu(move |window, cx| Some(build_menu(enabled, window, cx)))
+                .menu(move |window, cx| Some(build_menu(enabled, uses_language_server, window, cx)))
                 .anchor(gpui::Anchor::BottomRight)
                 .trigger_with_tooltip(
                     Button::new("windsurf-status", label)
@@ -114,7 +144,12 @@ impl Render for WindsurfStatusItem {
     }
 }
 
-fn build_menu(enabled: bool, window: &mut Window, cx: &mut App) -> Entity<ContextMenu> {
+fn build_menu(
+    enabled: bool,
+    uses_language_server: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
     // Defined by the API key import feature; the entries are left out until it exists.
     let import_action = cx.build_action(IMPORT_API_KEY_ACTION, None).ok();
     let open_setting_action = cx.build_action(OPEN_API_KEY_SETTING_ACTION, None).ok();
@@ -140,6 +175,19 @@ fn build_menu(enabled: bool, window: &mut Window, cx: &mut App) -> Entity<Contex
                 Some(action.boxed_clone()),
                 move |window, cx| window.dispatch_action(action.boxed_clone(), cx),
             )
+        })
+        .when(uses_language_server, |menu| {
+            menu.separator()
+                .entry(
+                    "Restart Language Server",
+                    Some(RestartLanguageServer.boxed_clone()),
+                    |window, cx| window.dispatch_action(RestartLanguageServer.boxed_clone(), cx),
+                )
+                .entry(
+                    "Show Language Server Version and Path",
+                    Some(ShowLanguageServerInfo.boxed_clone()),
+                    |window, cx| window.dispatch_action(ShowLanguageServerInfo.boxed_clone(), cx),
+                )
         })
         .separator()
         .entry(
@@ -208,12 +256,72 @@ pub(crate) fn last_request_text(cx: &App) -> String {
         .unwrap_or_else(|error| format!("couldn't format the request: {error}"))
 }
 
+pub(crate) fn language_server_info_text(cx: &App) -> String {
+    let Some(windsurf) = Windsurf::global(cx) else {
+        return "Windsurf isn't initialized.".to_string();
+    };
+    let settings = WindsurfSettings::get_global(cx);
+    let Some(backend) = windsurf.read(cx).language_server() else {
+        return "The language server backend isn't selected (`fork.windsurf.backend`).".to_string();
+    };
+    let located = binary::locate(settings.language_server_path.as_deref());
+    let product = located.as_ref().ok().map(|path| binary::product_info(path));
+    let (state, info) = match backend.status() {
+        ServerStatus::Idle => (
+            "not started (starts with the first prediction)".to_string(),
+            None,
+        ),
+        ServerStatus::Starting => ("starting".to_string(), None),
+        ServerStatus::Running(info) => ("running".to_string(), Some(info)),
+        ServerStatus::NotFound(message) => (format!("not found: {message}"), None),
+        ServerStatus::Failed { message, .. } => (format!("failed: {message}"), None),
+    };
+    let summary = serde_json::json!({
+        "state": state,
+        "binary": match &located {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => error.to_string(),
+        },
+        "configured_path": settings.language_server_path,
+        "version": product.as_ref().and_then(|product| product.codeium_version.clone()),
+        "app_version": product.as_ref().and_then(|product| product.windsurf_version.clone()),
+        "build": info.as_ref().and_then(|info| info.build.clone()),
+        "pid": info.as_ref().and_then(|info| info.pid),
+        "data_dir": crate::language_server_data_dir().to_string_lossy(),
+        "log": info
+            .as_ref()
+            .and_then(|info| info.log_path.as_ref())
+            .map(|path| path.to_string_lossy().into_owned()),
+    });
+    serde_json::to_string_pretty(&summary)
+        .unwrap_or_else(|error| format!("couldn't format the information: {error}"))
+}
+
+pub(crate) fn show_language_server_info(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let text = language_server_info_text(cx);
+    show_read_only_text(workspace, "Windsurf Language Server", text, window, cx);
+}
+
 pub(crate) fn show_last_request(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     let text = last_request_text(cx);
+    show_read_only_text(workspace, "Windsurf Last Request", text, window, cx);
+}
+
+fn show_read_only_text(
+    workspace: &mut Workspace,
+    title: &'static str,
+    text: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let project = workspace.project().clone();
     let language = workspace.app_state().languages.language_for_name("JSON");
     cx.spawn_in(window, async move |workspace, cx| {
@@ -226,7 +334,6 @@ pub(crate) fn show_last_request(
             buffer.set_capability(Capability::ReadOnly, cx);
         });
         workspace.update_in(cx, |workspace, window, cx| {
-            let title = "Windsurf Last Request";
             let multi_buffer =
                 cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(title.into()));
             let editor = cx.new(|cx| {

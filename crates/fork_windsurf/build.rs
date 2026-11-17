@@ -4,6 +4,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         [
             "exa/auth_pb/auth.proto",
             "exa/api_server_pb/api_server.proto",
+            "exa/language_server_pb/language_server.proto",
+            "exa/extension_server_pb/extension_server.proto",
         ],
         ["proto"],
     )?;

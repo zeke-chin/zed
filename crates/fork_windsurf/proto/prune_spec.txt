@@ -10,3 +10,21 @@ root .exa.api_server_pb.ProvideFeedbackResponse
 keep .exa.cortex_pb.CortexTrajectoryStep type status metadata code_action view_file view_code_item clipboard supercomplete_active_doc supercomplete_feedback read_terminal
 keep .exa.cortex_pb.CortexTrajectory trajectory_id cascade_id trajectory_type steps parent_references source metadata
 keep .exa.prompt_pb.UnifiedPromptComponents cortex_trajectory command_intent_info chat_messages code_diagnostics other_documents supercomplete_feedback_context
+# The language server bridge (stage 8): what Zed sends to the official language server and what it reports back.
+root .exa.language_server_pb.HandleStreamingTabV2Request
+root .exa.language_server_pb.HandleStreamingTabV2Response
+root .exa.language_server_pb.RefreshContextForIdeActionRequest
+root .exa.language_server_pb.RefreshContextForIdeActionResponse
+root .exa.language_server_pb.ProvideCompletionFeedbackRequest
+root .exa.language_server_pb.ProvideCompletionFeedbackResponse
+root .exa.language_server_pb.HeartbeatRequest
+root .exa.language_server_pb.HeartbeatResponse
+root .exa.language_server_pb.ExitRequest
+root .exa.language_server_pb.ExitResponse
+root .exa.extension_server_pb.LanguageServerStartedRequest
+root .exa.extension_server_pb.LanguageServerStartedResponse
+keep .exa.language_server_pb.HandleStreamingTabV2Request metadata document editor_options diagnostics supercomplete_trigger_condition clipboard_entry other_documents disable_tab_jump
+keep .exa.language_server_pb.HandleStreamingTabV2Response completion_id prompt_id request_uid filter_reason stop_reason diff tab_jump noop
+keep .exa.language_server_pb.RefreshContextForIdeActionRequest metadata active_document open_document_uris other_documents workspace_uris blocking ide_action recently_opened_uris
+keep .exa.language_server_pb.ProvideCompletionFeedbackRequest metadata is_accepted feedback_delay_ms completion_id prompt_id source document is_intentional_reject completion_text
+keep .exa.language_server_pb.HeartbeatRequest metadata

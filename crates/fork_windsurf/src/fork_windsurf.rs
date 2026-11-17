@@ -5,6 +5,7 @@ mod credentials;
 mod delegate;
 pub mod diff;
 pub mod feedback;
+pub mod language_server;
 pub mod native;
 mod prefetch;
 pub mod proto;
@@ -25,25 +26,36 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use editor::{EditPredictionRequestTrigger, Editor};
-use futures::FutureExt as _;
-use gpui::{App, AppContext as _, Context, Entity, Global, Window, actions};
+use futures::{FutureExt as _, future::BoxFuture};
+use gpui::{
+    App, AppContext as _, Context, Entity, EntityId, Global, Subscription, WeakEntity, Window,
+    actions,
+};
 use language::{
-    Anchor, Buffer, BufferSnapshot, ToOffset as _,
-    language_settings::{EditPredictionProvider, all_language_settings},
+    Anchor, Buffer, BufferEvent, BufferSnapshot, ToOffset as _,
+    language_settings::{EditPredictionProvider, LanguageSettings, all_language_settings},
 };
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore, WindsurfBackend};
 use workspace::Workspace;
 
-use backend::{FeedbackReport, TabBackend, TabExchange, TabRequestInput};
+use backend::{
+    FeedbackReport, LanguageServerContext, OtherDocument, TabBackend, TabExchange, TabRequestInput,
+};
 use clipboard::{CLIPBOARD_WINDOW, PendingCopy};
 use context::SelectionWindow;
 pub use credentials::{ImportApiKey, OpenApiKeySetting};
 pub use delegate::WindsurfDelegate;
 use feedback::{DocumentInfo, MAX_FEEDBACK_ENTRIES, MIN_REPORT_INTERVAL, PredictionRecord};
+use language_server::{
+    LanguageServerBackend, LanguageServerConfig, ServerSettings, ServerStatus,
+    limit_other_documents,
+};
 use native::{ClientConfig, NativeBackend, connect::ConnectError};
-use proto::exa::prompt_pb::SupercompleteFeedback;
+use proto::exa::{
+    codeium_common_pb::SupercompleteTriggerCondition, prompt_pb::SupercompleteFeedback,
+};
 use trajectory::Trajectory;
 use trajectory_cache::TrajectoryCache;
 
@@ -54,6 +66,10 @@ actions!(
         ShowLastRequest,
         /// Turns Windsurf edit predictions on or off.
         ToggleEnabled,
+        /// Stops the Windsurf language server and starts it again (language server backend).
+        RestartLanguageServer,
+        /// Shows the path, version and data directory of the Windsurf language server.
+        ShowLanguageServerInfo,
     ]
 );
 
@@ -117,6 +133,8 @@ pub enum Status {
     MissingApiKey,
     Ready,
     Requesting,
+    /// The language server backend is starting the server.
+    StartingLanguageServer,
     Error(ErrorStatus),
 }
 
@@ -134,10 +152,20 @@ pub enum ErrorStatus {
     },
     Protocol(String),
     Server(String),
+    /// No language server binary (language server backend).
+    LanguageServerNotFound(String),
+    LanguageServerFailed {
+        message: String,
+        retry_in: Duration,
+    },
+    /// The language server backend can't serve files of a remote project.
+    RemoteProject,
 }
 
 pub(crate) enum RequestOutcome {
     Predicted(usize),
+    /// The language server predicted a jump to where the next edit is.
+    TabJump,
     NoPrediction,
     Discarded(&'static str),
     /// A predictive response, kept until the buffer reaches the state it assumed.
@@ -181,6 +209,8 @@ pub(crate) struct PreparedRequest {
 #[derive(Clone)]
 pub(crate) struct RequestDetails {
     pub kind: RequestKind,
+    /// The call that was made, for the log.
+    pub method: &'static str,
     /// Fingerprints of the steps sent, to match the returned hashes.
     pub fingerprints: Vec<u64>,
     pub cached_steps: usize,
@@ -225,10 +255,43 @@ pub struct LastRequest {
     pub response: serde_json::Value,
 }
 
+/// Creates the language server backend when it gets selected. Injected so
+/// that tests can use a fake server.
+pub type LanguageServerFactory = Arc<dyn Fn(&App) -> LanguageServerBackend>;
+
+/// The language server backend while it's selected.
+struct LanguageServerState {
+    backend: LanguageServerBackend,
+    /// Buffers whose edits are passed on, with their URI.
+    documents: HashMap<EntityId, TrackedDocument>,
+}
+
+struct TrackedDocument {
+    uri: Option<String>,
+    _subscriptions: [Subscription; 2],
+}
+
+/// A Tab Jump from the language server waiting for the cursor to arrive at
+/// its target, which triggers the request for the edit there.
+#[derive(Clone)]
+pub(crate) struct PendingJump {
+    pub buffer: WeakEntity<Buffer>,
+    pub target: Anchor,
+    pub completion_id: String,
+    pub prompt_id: String,
+    pub shown_at: Instant,
+}
+
 /// State shared by every editor's delegate: the edit history, error and
 /// backoff state, and what the status bar shows.
 pub struct Windsurf {
     backend: Arc<dyn TabBackend>,
+    language_server_factory: LanguageServerFactory,
+    language_server: Option<LanguageServerState>,
+    /// The last request was skipped because the file is in a remote project,
+    /// which the language server can't serve.
+    remote_project_skipped: bool,
+    pending_jump: Option<PendingJump>,
     trajectory: Trajectory,
     trajectory_cache: TrajectoryCache,
     pending_copy: Option<PendingCopy>,
@@ -244,7 +307,7 @@ pub struct Windsurf {
     retry_at: Option<Instant>,
     backoff: Duration,
     last_request: Option<LastRequest>,
-    applied_settings: Option<(bool, Option<String>)>,
+    applied_settings: Option<(bool, Option<String>, WindsurfBackend)>,
 }
 
 struct GlobalWindsurf(Entity<Windsurf>);
@@ -252,9 +315,16 @@ struct GlobalWindsurf(Entity<Windsurf>);
 impl Global for GlobalWindsurf {}
 
 impl Windsurf {
-    pub fn new(backend: Arc<dyn TabBackend>) -> Self {
+    pub fn new(
+        backend: Arc<dyn TabBackend>,
+        language_server_factory: LanguageServerFactory,
+    ) -> Self {
         Self {
             backend,
+            language_server_factory,
+            language_server: None,
+            remote_project_skipped: false,
+            pending_jump: None,
             trajectory: Trajectory::default(),
             trajectory_cache: TrajectoryCache::default(),
             pending_copy: None,
@@ -290,6 +360,15 @@ impl Windsurf {
         self.backend.clone()
     }
 
+    /// The language server backend, while it's selected.
+    pub fn language_server(&self) -> Option<&LanguageServerBackend> {
+        self.language_server.as_ref().map(|state| &state.backend)
+    }
+
+    pub(crate) fn uses_language_server(&self) -> bool {
+        self.language_server.is_some()
+    }
+
     pub fn stats(&self) -> Stats {
         self.stats
     }
@@ -318,9 +397,30 @@ impl Windsurf {
         if settings.api_key.is_none() {
             return Status::MissingApiKey;
         }
+        let now = cx.background_executor().now();
+        if let Some(state) = &self.language_server {
+            if self.remote_project_skipped {
+                return Status::Error(ErrorStatus::RemoteProject);
+            }
+            match state.backend.status() {
+                ServerStatus::NotFound(message) => {
+                    return Status::Error(ErrorStatus::LanguageServerNotFound(message));
+                }
+                ServerStatus::Failed { message, retry_at } => {
+                    return Status::Error(ErrorStatus::LanguageServerFailed {
+                        message,
+                        retry_in: retry_at
+                            .map(|retry_at| retry_at.saturating_duration_since(now))
+                            .unwrap_or_default(),
+                    });
+                }
+                ServerStatus::Starting => return Status::StartingLanguageServer,
+                ServerStatus::Idle | ServerStatus::Running(_) => {}
+            }
+        }
         let retry_in = self
             .retry_at
-            .map(|retry_at| retry_at.saturating_duration_since(cx.background_executor().now()))
+            .map(|retry_at| retry_at.saturating_duration_since(now))
             .unwrap_or_default();
         match &self.error {
             Some(ConnectError::Unauthenticated(message)) => {
@@ -348,6 +448,9 @@ impl Windsurf {
     fn set_selected(&mut self, selected: bool, cx: &mut Context<Self>) {
         if self.selected != selected {
             self.selected = selected;
+            if !selected && let Some(state) = &self.language_server {
+                cx.background_spawn(state.backend.shutdown()).detach();
+            }
             cx.notify();
         }
     }
@@ -356,28 +459,186 @@ impl Windsurf {
     /// when a request is about to be sent.
     pub fn can_request(&self, cx: &App) -> bool {
         let settings = WindsurfSettings::get_global(cx);
-        self.selected
-            && settings.enabled
-            && settings.api_key.is_some()
-            && settings.backend == WindsurfBackend::Native
+        self.selected && settings.enabled && settings.api_key.is_some()
     }
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
-        let settings = WindsurfSettings::get_global(cx);
-        let applied = (settings.enabled, settings.api_key.clone());
+        let settings = WindsurfSettings::get_global(cx).clone();
+        let applied = (settings.enabled, settings.api_key.clone(), settings.backend);
         let previous = self.applied_settings.replace(applied.clone());
         if previous.is_some_and(|previous| previous != applied) {
             self.error = None;
             self.retry_at = None;
             self.backoff = Duration::ZERO;
+            self.pending_jump = None;
             cx.background_spawn(self.backend.forget_credentials())
                 .detach();
             cx.notify();
         }
+        let wants_language_server = settings.enabled
+            && settings.api_key.is_some()
+            && settings.backend == WindsurfBackend::LanguageServer;
+        if wants_language_server {
+            if self.language_server.is_none() {
+                log::info!("windsurf: using the language server backend");
+                self.language_server = Some(LanguageServerState {
+                    backend: (self.language_server_factory)(cx),
+                    documents: HashMap::default(),
+                });
+                for buffer in self.trajectory.tracked_buffers().collect::<Vec<_>>() {
+                    self.track_language_server_document(&buffer, cx);
+                }
+            }
+            if let Some(state) = &self.language_server {
+                state.backend.set_settings(ServerSettings {
+                    api_key: settings.api_key.clone(),
+                    binary_path: settings.language_server_path,
+                    proxy: cx.http_client().proxy().map(|proxy| proxy.to_string()),
+                });
+            }
+        } else if let Some(state) = self.language_server.take() {
+            log::info!(
+                "windsurf: the language server backend is no longer selected; stopping the server"
+            );
+            self.remote_project_skipped = false;
+            cx.background_spawn(state.backend.shutdown()).detach();
+            cx.notify();
+        }
+    }
+
+    /// Stops the language server when Zed quits. Only waits briefly; a server
+    /// that's still there exits once its parent pipe closes with Zed.
+    fn on_quit(&mut self, _cx: &mut Context<Self>) -> BoxFuture<'static, ()> {
+        match self.language_server.take() {
+            Some(state) => state.backend.shutdown_within(Duration::from_millis(150)),
+            None => futures::future::ready(()).boxed(),
+        }
+    }
+
+    pub fn restart_language_server(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &self.language_server else {
+            return;
+        };
+        self.error = None;
+        self.retry_at = None;
+        self.backoff = Duration::ZERO;
+        let restart = state.backend.restart(true);
+        cx.spawn(async move |this, cx| {
+            restart.await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     pub fn track_buffer(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
         self.trajectory.track(buffer, cx);
+        self.track_language_server_document(buffer, cx);
+    }
+
+    /// Passes the buffer's edits on to the language server, while that
+    /// backend is selected.
+    fn track_language_server_document(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.language_server else {
+            return;
+        };
+        let buffer_id = buffer.entity_id();
+        if state.documents.contains_key(&buffer_id) {
+            return;
+        }
+        let edited = cx.subscribe(buffer, |this, buffer, event: &BufferEvent, cx| {
+            if matches!(
+                event,
+                BufferEvent::Edited { .. } | BufferEvent::Reloaded | BufferEvent::FileHandleChanged
+            ) {
+                this.sync_language_server_document(&buffer, cx);
+            }
+        });
+        let released = cx.observe_release(buffer, move |this, _, _| {
+            if let Some(state) = &mut this.language_server
+                && let Some(document) = state.documents.remove(&buffer_id)
+                && let Some(uri) = document.uri
+            {
+                state.backend.close_document(&uri);
+            }
+        });
+        state.documents.insert(
+            buffer_id,
+            TrackedDocument {
+                uri: None,
+                _subscriptions: [edited, released],
+            },
+        );
+        self.sync_language_server_document(buffer, cx);
+    }
+
+    fn sync_language_server_document(&mut self, buffer: &Entity<Buffer>, cx: &App) {
+        let Some(state) = &mut self.language_server else {
+            return;
+        };
+        let buffer_id = buffer.entity_id();
+        let buffer = buffer.read(cx);
+        if !is_local(buffer, cx) {
+            return;
+        }
+        let Some(location) = context::buffer_location(buffer, cx) else {
+            return;
+        };
+        let uri = location.uri();
+        if let Some(document) = state.documents.get_mut(&buffer_id) {
+            document.uri = Some(uri.clone());
+        }
+        let (_, editor_language) = context::language_for(
+            buffer
+                .language()
+                .map(|language| language.name().0.to_string()),
+        );
+        state.backend.update_document(
+            &uri,
+            &location.workspace_uri(),
+            &editor_language,
+            buffer.text_snapshot(),
+        );
+    }
+
+    /// `SELECTION_CHANGED` for the language server, when the cursor moved.
+    pub(crate) fn selection_changed(&self, buffer: &Entity<Buffer>, cursor: Anchor, cx: &App) {
+        let Some(state) = &self.language_server else {
+            return;
+        };
+        state.backend.selection_changed(|| {
+            let buffer = buffer.read(cx);
+            if !is_local(buffer, cx) {
+                return None;
+            }
+            let location = context::buffer_location(buffer, cx)?;
+            Some(
+                context::document_context(&buffer.snapshot(), cursor, &location, buffer.is_dirty())
+                    .document,
+            )
+        });
+    }
+
+    pub(crate) fn set_pending_jump(&mut self, jump: Option<PendingJump>) {
+        self.pending_jump = jump;
+    }
+
+    /// Takes the pending Tab Jump when the cursor arrived at its target.
+    pub(crate) fn take_landed_jump(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cursor: Anchor,
+        cx: &App,
+    ) -> Option<PendingJump> {
+        let jump = self.pending_jump.as_ref()?;
+        if jump.buffer.upgrade().as_ref() != Some(buffer) {
+            return None;
+        }
+        let snapshot = buffer.read(cx).snapshot();
+        if jump.target.to_offset(&snapshot) != cursor.to_offset(&snapshot) {
+            return None;
+        }
+        self.pending_jump.take()
     }
 
     pub(crate) fn next_request_id(&mut self) -> u64 {
@@ -400,6 +661,7 @@ impl Windsurf {
         buffer: &Entity<Buffer>,
         cursor: Anchor,
         trigger_id: &str,
+        trigger: SupercompleteTriggerCondition,
         cx: &mut Context<Self>,
     ) -> Preparation {
         if !self.can_request(cx) || matches!(self.error, Some(ConnectError::Unauthenticated(_))) {
@@ -413,6 +675,11 @@ impl Windsurf {
         let Some(api_key) = WindsurfSettings::get_global(cx).api_key.clone() else {
             return Preparation::Skip;
         };
+        if self.language_server.is_some() {
+            return self.prepare_language_server_request(
+                request_id, buffer, cursor, trigger_id, trigger, api_key, cx,
+            );
+        }
         let started_at = Instant::now();
         self.trajectory.track(buffer, cx);
         self.trajectory.commit(cx);
@@ -446,6 +713,128 @@ impl Windsurf {
         Preparation::Send(prepared, snapshot)
     }
 
+    /// The language server keeps the history itself; the request carries the
+    /// document, the other open documents, diagnostics and the clipboard.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_language_server_request(
+        &mut self,
+        request_id: u64,
+        buffer: &Entity<Buffer>,
+        cursor: Anchor,
+        trigger_id: &str,
+        trigger: SupercompleteTriggerCondition,
+        api_key: String,
+        cx: &mut Context<Self>,
+    ) -> Preparation {
+        let started_at = Instant::now();
+        let remote = is_remote(buffer.read(cx), cx);
+        if remote != self.remote_project_skipped {
+            self.remote_project_skipped = remote;
+            if remote {
+                log::info!(
+                    "windsurf: the language server backend doesn't work in remote projects; no predictions there"
+                );
+            }
+            cx.notify();
+        }
+        if remote {
+            return Preparation::Skip;
+        }
+        self.trajectory.track(buffer, cx);
+        self.track_language_server_document(buffer, cx);
+        self.sync_language_server_document(buffer, cx);
+        let Some(backend) = self.language_server().cloned() else {
+            return Preparation::Skip;
+        };
+
+        let clipboard = self
+            .pending_copy
+            .take()
+            .filter(|copy| {
+                cx.background_executor()
+                    .now()
+                    .saturating_duration_since(copy.copied_at)
+                    <= CLIPBOARD_WINDOW
+            })
+            .map(|copy| copy.content)
+            .unwrap_or_default();
+        let other_documents = limit_other_documents(
+            self.trajectory
+                .tracked_buffers()
+                .filter(|tracked| tracked != buffer)
+                .filter_map(|tracked| {
+                    let tracked = tracked.read(cx);
+                    if !is_local(tracked, cx) {
+                        return None;
+                    }
+                    let location = context::buffer_location(tracked, cx)?;
+                    let (_, editor_language) = context::language_for(
+                        tracked
+                            .language()
+                            .map(|language| language.name().0.to_string()),
+                    );
+                    Some(OtherDocument {
+                        uri: location.uri(),
+                        workspace_uri: location.workspace_uri(),
+                        editor_language,
+                        text: tracked.text(),
+                        is_dirty: tracked.is_dirty(),
+                    })
+                })
+                .collect(),
+        );
+
+        let buffer_entity = buffer;
+        let buffer = buffer_entity.read(cx);
+        let Some(location) = context::buffer_location(buffer, cx) else {
+            return Preparation::Skip;
+        };
+        let snapshot = buffer.snapshot();
+        let document = context::document_context(&snapshot, cursor, &location, buffer.is_dirty());
+        let cursor_row = snapshot.offset_to_point(cursor.to_offset(&snapshot)).row;
+        let diagnostics =
+            context::diagnostics_near(&snapshot, cursor_row, &document.document.absolute_uri);
+        let language_settings = LanguageSettings::for_buffer(buffer, cx);
+        let settings = WindsurfSettings::get_global(cx);
+        let language_server = LanguageServerContext {
+            trigger,
+            clipboard,
+            other_documents,
+            disable_tab_jump: !settings.tab_jump,
+            tab_size: language_settings.tab_size.get(),
+            insert_spaces: !language_settings.hard_tabs,
+        };
+        let details = RequestDetails {
+            kind: RequestKind::Trigger,
+            method: language_server::HANDLE_STREAMING_TAB,
+            fingerprints: Vec::new(),
+            cached_steps: 0,
+            context_elapsed: started_at.elapsed(),
+            document: DocumentInfo::of(&document.document),
+        };
+        self.stats.requests += 1;
+        let prepared = PreparedRequest {
+            backend: Arc::new(backend),
+            api_key,
+            input: TabRequestInput {
+                document: document.document,
+                diagnostics,
+                steps: Vec::new(),
+                mainline_trajectory_id: String::new(),
+                cached_hashes: Vec::new(),
+                feedback: Vec::new(),
+                trigger_id: trigger_id.to_string(),
+                language_server,
+            },
+            window: document.window,
+            abs_path: location.abs_path.to_string_lossy().into_owned(),
+            details,
+        };
+        self.in_flight.insert(request_id);
+        cx.notify();
+        Preparation::Send(prepared, snapshot)
+    }
+
     /// Collects the context for a predictive request: the buffer as if
     /// `assumed_text` (the buffer with the prediction applied) were its text,
     /// and the trajectory with the accepting edit as one more step. Returns
@@ -458,7 +847,11 @@ impl Windsurf {
         trigger_id: &str,
         cx: &mut Context<Self>,
     ) -> Option<PreparedRequest> {
-        if !self.can_request(cx) || self.error.is_some() || self.retry_at.is_some() {
+        if !self.can_request(cx)
+            || self.error.is_some()
+            || self.retry_at.is_some()
+            || self.uses_language_server()
+        {
             return None;
         }
         let api_key = WindsurfSettings::get_global(cx).api_key.clone()?;
@@ -506,6 +899,7 @@ impl Windsurf {
         let cached_hashes = self.trajectory_cache.hashes_for(&fingerprints);
         let details = RequestDetails {
             kind,
+            method: "GetTab",
             cached_steps: cached_hashes.len(),
             fingerprints,
             context_elapsed: started_at.elapsed(),
@@ -526,6 +920,7 @@ impl Windsurf {
                 cached_hashes,
                 feedback: self.feedback_context(),
                 trigger_id: trigger_id.to_string(),
+                language_server: LanguageServerContext::default(),
             },
             window: document.window,
             abs_path: location.abs_path.to_string_lossy().into_owned(),
@@ -602,6 +997,17 @@ impl Windsurf {
         if !self.can_request(cx) {
             return;
         }
+        if self.uses_language_server() {
+            self.report_language_server_feedback(
+                &record.completion_id,
+                &record.prompt_id,
+                accepted,
+                feedback_delay,
+                buffer,
+                cx,
+            );
+            return;
+        }
         match before_accept {
             Some(snapshot) if accepted => self.trajectory.commit_buffer_at(buffer, snapshot, cx),
             _ => self.trajectory.commit(cx),
@@ -625,6 +1031,59 @@ impl Windsurf {
             self.feedback.pop_front();
         }
         self.report_feedback(record, accepted, feedback_delay_ms, now, cx);
+    }
+
+    /// `ProvideCompletionFeedback`: the language server records the feedback
+    /// in its own history and reports it to the cloud. Every accept and reject
+    /// is sent, like the official extension does.
+    pub(crate) fn report_language_server_feedback(
+        &mut self,
+        completion_id: &str,
+        prompt_id: &str,
+        accepted: bool,
+        feedback_delay: Duration,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(backend) = self.language_server().cloned() else {
+            return;
+        };
+        if completion_id.is_empty() {
+            return;
+        }
+        let document = {
+            let buffer = buffer.read(cx);
+            context::buffer_location(buffer, cx).map(|location| {
+                context::document_context_for_text(
+                    buffer.text(),
+                    0,
+                    buffer
+                        .language()
+                        .map(|language| language.name().0.to_string()),
+                    &location,
+                    buffer.is_dirty(),
+                    None,
+                )
+                .document
+            })
+        };
+        self.stats.feedback_reports += 1;
+        let report = FeedbackReport {
+            prompt_id: prompt_id.to_string(),
+            completion_id: completion_id.to_string(),
+            accepted,
+            from_cache: false,
+            feedback_delay_ms: feedback_delay.as_millis() as i64,
+            timestamp_unix_ms: feedback::unix_millis(SystemTime::now()),
+        };
+        let call = backend.provide_completion_feedback(report, document);
+        cx.background_spawn(async move {
+            match call.await {
+                Ok(()) => log::debug!("windsurf: ProvideCompletionFeedback sent"),
+                Err(error) => log::warn!("windsurf: ProvideCompletionFeedback failed: {error}"),
+            }
+        })
+        .detach();
     }
 
     fn report_feedback(
@@ -681,6 +1140,7 @@ impl Windsurf {
         self.in_flight.remove(&request_id);
         let outcome_text = match &outcome {
             RequestOutcome::Predicted(edit_count) => format!("predicted {edit_count} edit(s)"),
+            RequestOutcome::TabJump => "Tab Jump".to_string(),
             RequestOutcome::NoPrediction => "no prediction".to_string(),
             RequestOutcome::Discarded(reason) => format!("discarded: {reason}"),
             RequestOutcome::Prefetched => "kept for when the prediction is accepted".to_string(),
@@ -706,7 +1166,8 @@ impl Windsurf {
         let retry_at = match &exchange.result {
             Ok(stream) => {
                 log::info!(
-                    "windsurf: GetTab ({}) finished in {} ms (context {} ms, first delta after {} ms, {} deltas, stop reason {}; request {request_text}): {outcome_text}",
+                    "windsurf: {} ({}) finished in {} ms (context {} ms, first delta after {} ms, {} deltas, stop reason {}; request {request_text}): {outcome_text}",
+                    details.method,
                     details.kind.name(),
                     exchange.elapsed.as_millis(),
                     details.context_elapsed.as_millis(),
@@ -728,7 +1189,8 @@ impl Windsurf {
             }
             Err(error) => {
                 log::warn!(
-                    "windsurf: GetTab ({}) failed after {} ms (request {request_text}): {error}",
+                    "windsurf: {} ({}) failed after {} ms (request {request_text}): {error}",
+                    details.method,
                     details.kind.name(),
                     exchange.elapsed.as_millis()
                 );
@@ -747,7 +1209,11 @@ impl Windsurf {
         log::debug!("windsurf: totals: {}", self.stats.to_json());
         self.last_request = Some(LastRequest {
             sent_at: SystemTime::now(),
-            request: exchange.request.as_ref().map(redacted_request_json),
+            request: exchange
+                .request
+                .as_ref()
+                .map(redacted_request_json)
+                .or_else(|| exchange.described_request.clone()),
             response: response_summary(exchange, details, &outcome_text),
         });
         cx.notify();
@@ -762,6 +1228,7 @@ fn response_summary(
 ) -> serde_json::Value {
     let mut summary = serde_json::json!({
         "kind": details.kind.name(),
+        "method": details.method,
         "outcome": outcome,
         "elapsed_ms": exchange.elapsed.as_millis() as u64,
         "context_ms": details.context_elapsed.as_millis() as u64,
@@ -781,6 +1248,20 @@ fn response_summary(
             summary["noop"] = stream.noop.into();
             summary["tab_jump"] = stream.tab_jump.into();
             summary["request_id"] = stream.request_id.clone().into();
+            if !stream.completion_id.is_empty() {
+                summary["completion_id"] = stream.completion_id.clone().into();
+                summary["prompt_id"] = stream.prompt_id.clone().into();
+            }
+            if let Some((start_line, end_line)) = stream.line_range {
+                summary["line_range"] = serde_json::json!([start_line, end_line]);
+            }
+            if let Some((row, column)) = stream.jump_position {
+                summary["jump_position"] =
+                    serde_json::json!({ "row": row, "column_utf16": column });
+            }
+            if let Some(reason) = &stream.filter_reason {
+                summary["filter_reason"] = reason.clone().into();
+            }
         }
         Err(error) => summary["error"] = error.to_string().into(),
     }
@@ -808,6 +1289,16 @@ pub fn redacted_request_json(
     value
 }
 
+/// Whether the buffer's file is on this machine; the language server can't
+/// serve remote projects.
+fn is_local(buffer: &Buffer, cx: &App) -> bool {
+    project::File::from_dyn(buffer.file()).is_some_and(|file| file.worktree.read(cx).is_local())
+}
+
+fn is_remote(buffer: &Buffer, cx: &App) -> bool {
+    project::File::from_dyn(buffer.file()).is_some_and(|file| !file.worktree.read(cx).is_local())
+}
+
 pub fn init(cx: &mut App) {
     credentials::init(cx);
     let executor = cx.background_executor().clone();
@@ -816,14 +1307,67 @@ pub fn init(cx: &mut App) {
         Arc::new(move |duration| executor.timer(duration).boxed()),
         ClientConfig::default(),
     );
-    init_with_backend(Arc::new(backend), cx);
+    init_with_backends(Arc::new(backend), language_server_factory(), cx);
 }
 
+/// The data directory of the language server Zed starts: its own, so that it
+/// never shares state with a Devin or Windsurf app.
+pub fn language_server_data_dir() -> std::path::PathBuf {
+    paths::data_dir().join("windsurf-ls")
+}
+
+fn language_server_factory() -> LanguageServerFactory {
+    Arc::new(|cx: &App| {
+        let timer_executor = cx.background_executor().clone();
+        let clock_executor = cx.background_executor().clone();
+        let spawn_executor = cx.background_executor().clone();
+        #[cfg(unix)]
+        let launcher: Arc<dyn language_server::Launcher> =
+            Arc::new(language_server::process::ProcessLauncher);
+        #[cfg(not(unix))]
+        let launcher: Arc<dyn language_server::Launcher> = Arc::new(UnsupportedLauncher);
+        LanguageServerBackend::new(
+            launcher,
+            LanguageServerConfig::new(language_server_data_dir()),
+            Arc::new(move |duration| timer_executor.timer(duration).boxed()),
+            Arc::new(move || clock_executor.now()),
+            Arc::new(move |future| spawn_executor.spawn(future).detach()),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+struct UnsupportedLauncher;
+
+#[cfg(not(unix))]
+impl language_server::Launcher for UnsupportedLauncher {
+    fn launch(
+        &self,
+        _options: language_server::LaunchOptions,
+    ) -> BoxFuture<'static, Result<Arc<dyn language_server::RunningServer>, String>> {
+        futures::future::ready(Err(
+            "the language server backend is only implemented for macOS and Linux".to_string(),
+        ))
+        .boxed()
+    }
+}
+
+/// Like `init` with the given native backend; the language server backend
+/// starts the real binary.
 pub fn init_with_backend(backend: Arc<dyn TabBackend>, cx: &mut App) {
+    init_with_backends(backend, language_server_factory(), cx);
+}
+
+pub fn init_with_backends(
+    backend: Arc<dyn TabBackend>,
+    language_server_factory: LanguageServerFactory,
+    cx: &mut App,
+) {
     tab_jump::init(cx);
     let windsurf = cx.new(|cx| {
-        let mut windsurf = Windsurf::new(backend);
+        let mut windsurf = Windsurf::new(backend, language_server_factory);
         windsurf.apply_settings(cx);
+        cx.on_app_quit(Windsurf::on_quit).detach();
         windsurf
     });
     cx.set_global(GlobalWindsurf(windsurf.clone()));
@@ -841,21 +1385,11 @@ pub fn set_selected(selected: bool, cx: &mut App) {
     }
 }
 
-/// Whether editors should get the Windsurf delegate: enabled, a key is set
-/// and the native backend is selected.
+/// Whether editors should get the Windsurf delegate: enabled and a key is
+/// set, with either backend.
 pub fn should_provide_predictions(cx: &App) -> bool {
     let settings = WindsurfSettings::get_global(cx);
-    let should_provide = settings.enabled && settings.api_key.is_some();
-    if should_provide && settings.backend != WindsurfBackend::Native {
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            log::warn!(
-                "windsurf: the language server backend isn't implemented yet; no predictions are shown"
-            );
-        }
-        return false;
-    }
-    should_provide
+    settings.enabled && settings.api_key.is_some()
 }
 
 pub fn has_delegate(editor: &Editor) -> bool {
@@ -912,6 +1446,14 @@ pub fn status_items(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
         status::show_last_request(workspace, window, cx)
     });
     workspace.register_action(|_, _: &ToggleEnabled, _, cx| status::toggle_enabled(cx));
+    workspace.register_action(|_, _: &RestartLanguageServer, _, cx| {
+        if let Some(windsurf) = Windsurf::global(cx) {
+            windsurf.update(cx, |windsurf, cx| windsurf.restart_language_server(cx));
+        }
+    });
+    workspace.register_action(|workspace, _: &ShowLanguageServerInfo, window, cx| {
+        status::show_language_server_info(workspace, window, cx)
+    });
     let status_bar = workspace.status_bar().clone();
     cx.defer_in(window, move |_, window, cx| {
         let item = cx.new(status::WindsurfStatusItem::new);

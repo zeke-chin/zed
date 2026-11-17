@@ -2,7 +2,8 @@
 //! `proto/`. The definitions were extracted from the official language server
 //! 1.48.2 (build `fcf7ba39e6150055fad817f8716385b4d320d46d`) in stage 2 and
 //! pruned to what `GetUserJwt` and `GetTab` use, plus `GetChatMessage` and
-//! `ProvideFeedback` for stage 5. See `fork/spike/结论.md`.
+//! `ProvideFeedback` for stage 5, and the calls between Zed and the official
+//! language server for the stage 8 bridge. See `fork/spike/结论.md`.
 
 #![allow(clippy::all, clippy::pedantic, missing_docs, unused_qualifications)]
 

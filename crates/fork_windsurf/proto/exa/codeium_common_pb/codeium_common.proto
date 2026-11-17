@@ -878,6 +878,20 @@ enum CommandRequestSource {
   COMMAND_REQUEST_SOURCE_TAB_JUMP = 14;
 }
 
+enum SupercompleteTriggerCondition {
+  SUPERCOMPLETE_TRIGGER_CONDITION_UNSPECIFIED = 0;
+  SUPERCOMPLETE_TRIGGER_CONDITION_AUTOCOMPLETE_ACCEPT = 1;
+  SUPERCOMPLETE_TRIGGER_CONDITION_CURSOR_LINE_NAVIGATION = 2;
+  SUPERCOMPLETE_TRIGGER_CONDITION_TYPING = 3;
+  SUPERCOMPLETE_TRIGGER_CONDITION_FORCED = 4;
+  SUPERCOMPLETE_TRIGGER_CONDITION_TAB_JUMP_ACCEPT = 5;
+  SUPERCOMPLETE_TRIGGER_CONDITION_SUPERCOMPLETE_ACCEPT = 6;
+  SUPERCOMPLETE_TRIGGER_CONDITION_TAB_JUMP_PREDICTIVE = 7;
+  SUPERCOMPLETE_TRIGGER_CONDITION_AUTOCOMPLETE_PREDICTIVE = 8;
+  SUPERCOMPLETE_TRIGGER_CONDITION_SUPERCOMPLETE_PREDICTIVE = 9;
+  SUPERCOMPLETE_TRIGGER_CONDITION_TAB_JUMP_EDIT = 10;
+}
+
 enum IndexChoice {
   INDEX_CHOICE_UNSPECIFIED = 0;
   INDEX_CHOICE_GITHUB_BASE = 1;
@@ -1033,6 +1047,12 @@ message Metadata {
   repeated .exa.codeium_common_pb.DisplayOption supported_model_displays = 30;
   string f = 31;
   string team_id = 32;
+}
+
+message EditorOptions {
+  uint64 tab_size = 1;
+  bool insert_spaces = 2;
+  bool disable_autocomplete_in_comments = 3;
 }
 
 message WorkspacePath {
@@ -1469,6 +1489,10 @@ message ModelUsageStats {
   string message_id = 7;
   map<string, string> response_header = 8;
   bool provider_refusal = 12;
+}
+
+message SuperCompleteFilterReason {
+  string reason = 1;
 }
 
 message DiagnosticFix {

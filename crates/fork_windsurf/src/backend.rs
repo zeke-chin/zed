@@ -1,6 +1,7 @@
 //! What the delegate needs from a way of reaching Windsurf: the collected
 //! context goes in, the accumulated `GetTab` result comes out. The native
-//! client implements it; the language server bridge (stage 8) would too.
+//! client implements it, and so does the language server bridge (stage 8,
+//! `language_server.rs`), which turns its answers into the same result.
 
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use crate::{
     native::{connect::ConnectError, get_chat_message::ChatExchange, get_tab::TabStream},
     proto::exa::{
         api_server_pb::{GetChatMessageRequest, GetTabRequest},
-        codeium_common_pb::{CodeDiagnostic, Language},
+        codeium_common_pb::{CodeDiagnostic, Language, SupercompleteTriggerCondition},
         cortex_pb::CortexTrajectoryStep,
         prompt_pb::SupercompleteFeedback,
     },
@@ -50,6 +51,31 @@ pub struct TabRequestInput {
     pub feedback: Vec<SupercompleteFeedback>,
     /// `metadata.trigger_id`; a predictive request reuses its trigger's id.
     pub trigger_id: String,
+    /// Only read by the language server bridge.
+    pub language_server: LanguageServerContext,
+}
+
+/// Request fields only the language server's `HandleStreamingTabV2` takes;
+/// the native client leaves them alone.
+#[derive(Clone, Debug, Default)]
+pub struct LanguageServerContext {
+    pub trigger: SupercompleteTriggerCondition,
+    /// The clipboard when it was copied within the last five seconds.
+    pub clipboard: String,
+    pub other_documents: Vec<OtherDocument>,
+    pub disable_tab_jump: bool,
+    pub tab_size: u32,
+    pub insert_spaces: bool,
+}
+
+/// An open document other than the one the request is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtherDocument {
+    pub uri: String,
+    pub workspace_uri: String,
+    pub editor_language: String,
+    pub text: String,
+    pub is_dirty: bool,
 }
 
 pub struct TabExchange {
@@ -63,6 +89,9 @@ pub struct TabExchange {
     pub request_bytes: usize,
     /// The server had lost the trajectory cache and the full trajectory was sent again.
     pub resent_full_trajectory: bool,
+    /// The request for the debug view when it isn't a `GetTabRequest`
+    /// (the language server bridge), already redacted.
+    pub described_request: Option<serde_json::Value>,
 }
 
 /// What `ProvideFeedback` reports about a shown prediction.

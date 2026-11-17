@@ -6,6 +6,27 @@ package exa.language_server_pb;
 
 import "exa/codeium_common_pb/codeium_common.proto";
 import "exa/diff_action_pb/diff_action.proto";
+import "google/protobuf/timestamp.proto";
+
+enum IdeAction {
+  IDE_ACTION_UNSPECIFIED = 0;
+  IDE_ACTION_SAVE = 1;
+  IDE_ACTION_SELECTION_CHANGED = 2;
+  IDE_ACTION_VISIBLE_RANGES_CHANGED = 3;
+  IDE_ACTION_ACTIVE_EDITOR_CHANGED = 4;
+  IDE_ACTION_STARTUP = 5;
+}
+
+message HandleStreamingTabV2Request {
+  .exa.codeium_common_pb.Metadata metadata = 1;
+  .exa.codeium_common_pb.Document document = 2;
+  .exa.codeium_common_pb.EditorOptions editor_options = 3;
+  repeated .exa.codeium_common_pb.CodeDiagnostic diagnostics = 5;
+  .exa.codeium_common_pb.SupercompleteTriggerCondition supercomplete_trigger_condition = 6;
+  string clipboard_entry = 7;
+  repeated .exa.codeium_common_pb.Document other_documents = 9;
+  bool disable_tab_jump = 14;
+}
 
 message HandleStreamingTabV2Response {
   message Diff {
@@ -30,4 +51,59 @@ message HandleStreamingTabV2Response {
     .exa.codeium_common_pb.DocumentPosition jump_position = 2;
     bool is_import = 3;
   }
+  message NoOp {
+  }
+  string completion_id = 1;
+  string prompt_id = 2;
+  string request_uid = 3;
+  .exa.codeium_common_pb.SuperCompleteFilterReason filter_reason = 4;
+  .exa.codeium_common_pb.StopReason stop_reason = 5;
+  oneof suggestion {
+    .exa.language_server_pb.HandleStreamingTabV2Response.Diff diff = 7;
+    .exa.language_server_pb.HandleStreamingTabV2Response.TabJump tab_jump = 8;
+    .exa.language_server_pb.HandleStreamingTabV2Response.NoOp noop = 9;
+  }
+}
+
+message ProvideCompletionFeedbackRequest {
+  .exa.codeium_common_pb.Metadata metadata = 1;
+  bool is_accepted = 2;
+  int64 feedback_delay_ms = 3;
+  string completion_id = 4;
+  string prompt_id = 5;
+  .exa.codeium_common_pb.ProviderSource source = 7;
+  .exa.codeium_common_pb.Document document = 8;
+  bool is_intentional_reject = 11;
+  string completion_text = 15;
+}
+
+message ProvideCompletionFeedbackResponse {
+}
+
+message HeartbeatRequest {
+  .exa.codeium_common_pb.Metadata metadata = 1;
+}
+
+message HeartbeatResponse {
+  .google.protobuf.Timestamp last_extension_heartbeat = 1;
+}
+
+message RefreshContextForIdeActionRequest {
+  .exa.codeium_common_pb.Metadata metadata = 8;
+  .exa.codeium_common_pb.Document active_document = 1;
+  repeated string open_document_uris = 6;
+  repeated .exa.codeium_common_pb.Document other_documents = 5;
+  repeated string workspace_uris = 7;
+  bool blocking = 4;
+  .exa.language_server_pb.IdeAction ide_action = 10;
+  repeated string recently_opened_uris = 11;
+}
+
+message RefreshContextForIdeActionResponse {
+}
+
+message ExitRequest {
+}
+
+message ExitResponse {
 }

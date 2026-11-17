@@ -53,7 +53,7 @@ impl ConnectError {
         }
     }
 
-    fn from_http_status(status: StatusCode, body: &[u8]) -> Self {
+    pub(crate) fn from_http_status(status: StatusCode, body: &[u8]) -> Self {
         if let Ok(error) = serde_json::from_slice::<WireError>(body)
             && let Some(code) = error.code.as_deref()
         {

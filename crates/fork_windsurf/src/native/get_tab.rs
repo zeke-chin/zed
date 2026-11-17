@@ -150,6 +150,17 @@ pub struct TabStream {
     /// `PreResponse.cache_info_v2.hashes`: one hash per step that was sent.
     pub cache_hashes: Option<Vec<u64>>,
     pub deltas: usize,
+    /// Set by the language server bridge, whose answers carry their own ids.
+    pub prompt_id: String,
+    pub completion_id: String,
+    /// The language server's rewrite covers these whole lines (0-based,
+    /// end exclusive) of the document that was sent, instead of the
+    /// request's selection window.
+    pub line_range: Option<(u32, u32)>,
+    /// The language server's Tab Jump: row and UTF-16 column in `path`.
+    pub jump_position: Option<(u32, u32)>,
+    /// The language server dropped its prediction for this reason.
+    pub filter_reason: Option<String>,
 }
 
 impl TabStream {
@@ -325,6 +336,7 @@ mod tests {
             cached_hashes: Vec::new(),
             feedback: Vec::new(),
             trigger_id: "trigger".to_string(),
+            language_server: Default::default(),
         };
         let metadata = super::super::metadata(&config, "key", Some("jwt"), Some("trigger"));
         let request = build_request(&config, metadata, input);
@@ -406,6 +418,7 @@ mod tests {
             cached_hashes,
             feedback: Vec::new(),
             trigger_id: "trigger".to_string(),
+            language_server: Default::default(),
         }
     }
 

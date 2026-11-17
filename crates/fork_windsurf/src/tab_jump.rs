@@ -135,7 +135,8 @@ pub(crate) fn start(
     cx: &mut AsyncApp,
 ) -> Option<Task<Option<CurrentPrediction>>> {
     let collected = cx.update(|cx| {
-        if !WindsurfSettings::get_global(cx).tab_jump {
+        // The language server makes its own Tab Jump predictions.
+        if !WindsurfSettings::get_global(cx).tab_jump || windsurf.read(cx).uses_language_server() {
             return None;
         }
         collect(windsurf.read(cx), buffer, cursor, cx)
