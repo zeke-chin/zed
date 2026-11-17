@@ -6591,6 +6591,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fork_markdown_preview"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "markdown",
+ "pulldown-cmark 0.13.6",
+ "settings",
+ "theme",
+ "theme_settings",
+]
+
+[[package]]
 name = "fork_windsurf"
 version = "0.1.0"
 dependencies = [
@@ -10672,6 +10684,7 @@ dependencies = [
  "buffer_diff",
  "db",
  "editor",
+ "fork_markdown_preview",
  "fs",
  "gpui",
  "language",
