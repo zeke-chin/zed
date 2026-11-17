@@ -11,53 +11,58 @@ mod record;
 pub use record::CaptureInput;
 
 #[cfg(any(
-    rust_analyzer,
+    all(rust_analyzer, not(zed_no_webrtc)),
     not(any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     ))
 ))]
 mod livekit_client;
 #[cfg(any(
-    rust_analyzer,
+    all(rust_analyzer, not(zed_no_webrtc)),
     not(any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     ))
 ))]
 pub use livekit_client::*;
 
 #[cfg(all(
-    not(rust_analyzer),
+    any(not(rust_analyzer), zed_no_webrtc),
     any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     )
 ))]
 mod mock_client;
 #[cfg(all(
-    not(rust_analyzer),
+    any(not(rust_analyzer), zed_no_webrtc),
     any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     )
 ))]
 pub mod test;
 #[cfg(all(
-    not(rust_analyzer),
+    any(not(rust_analyzer), zed_no_webrtc),
     any(
         test,
         feature = "test-support",
         all(target_os = "windows", target_env = "gnu"),
-        target_os = "freebsd"
+        target_os = "freebsd",
+        zed_no_webrtc
     )
 ))]
 pub use mock_client::*;

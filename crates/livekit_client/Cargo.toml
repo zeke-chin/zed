@@ -42,17 +42,19 @@ settings.workspace = true
 smallvec.workspace = true
 util.workspace = true
 
-[target.'cfg(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd"))'.dependencies]
+[target.'cfg(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd", zed_no_webrtc))'.dependencies]
 livekit_api.workspace = true
 nanoid.workspace = true
 postage = { workspace = true, features = ["futures-traits", "logging", "blocking"] }
 
-[target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd")))'.dependencies]
+[target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd", zed_no_webrtc)))'.dependencies]
 libwebrtc.workspace = true
 livekit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio = { workspace = true, features = ["time"] }
+
+[target.'cfg(all(target_os = "linux", not(zed_no_webrtc)))'.dependencies]
 webrtc-sys.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies]

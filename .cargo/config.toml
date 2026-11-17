@@ -1,6 +1,7 @@
 [target.'cfg(all())']
 # v0 mangling scheme provides more detailed backtraces around closures
-rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
+# zed_no_webrtc (fork): drop LiveKit/WebRTC (calls, screen sharing) and use the mock client instead
+rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable", "--cfg", "zed_no_webrtc"]
 
 [alias]
 xtask = "run --package xtask --"
