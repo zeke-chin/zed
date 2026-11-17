@@ -29,7 +29,7 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
+    FocusHandle, Focusable, KeyContext, ListState, Pixels, Render, SharedString, Task,
     TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
     linear_gradient, list, prelude::*, px,
 };
@@ -58,7 +58,7 @@ use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
     Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    prelude::*, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -2528,7 +2528,8 @@ impl Sidebar {
             })
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    if event.modifiers().secondary(cx) {
+                    // FORK: click focuses the project, secondary-click toggles collapse.
+                    if !event.modifiers().secondary(cx) {
                         this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
                     } else if !this.has_filter_query(cx) {
                         this.toggle_collapse(&key_for_toggle, window, cx);
@@ -2990,17 +2991,11 @@ impl Sidebar {
                         let menu = menu
                             .custom_entry(
                                 {
-                                    move |_window, cx| {
+                                    move |_window, _cx| {
+                                        // FORK: a plain click focuses the project.
                                         let action = h_flex()
                                             .opacity(0.6)
-                                            .children(render_modifiers(
-                                                &Modifiers::secondary_key(cx),
-                                                PlatformStyle::platform(),
-                                                None,
-                                                Some(TextSize::Default.rems(cx).into()),
-                                                false,
-                                            ))
-                                            .child(Label::new("-click").color(Color::Muted));
+                                            .child(Label::new("click").color(Color::Muted));
 
                                         let label = if has_threads {
                                             "Focus Last Project"
@@ -3658,9 +3653,10 @@ impl Sidebar {
         };
 
         match entry {
+            // FORK: confirm on a header focuses the project, matching a plain click.
             ListEntry::ProjectHeader { key, .. } => {
                 let key = key.clone();
-                self.toggle_collapse(&key, window, cx);
+                self.activate_or_open_workspace_for_group(&key, window, cx);
             }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();

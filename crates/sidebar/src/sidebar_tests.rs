@@ -2279,19 +2279,8 @@ async fn test_keyboard_confirm_on_project_header_toggles_collapse(cx: &mut TestA
         sidebar.selection = Some(0);
     });
 
-    // Confirm on project header collapses the group
-    cx.dispatch_action(Confirm);
-    cx.run_until_parked();
-
-    assert_eq!(
-        visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "> [my-project]  <== selected",
-        ]
-    );
-
-    // Confirm again expands the group
+    // FORK: confirm on a project header focuses the project instead of toggling
+    // collapse; on the already-active project it does nothing.
     cx.dispatch_action(Confirm);
     cx.run_until_parked();
 
@@ -16574,4 +16563,166 @@ fn header_search_offsets(
         hidden,
         fullscreen,
     }
+}
+
+// FORK: tests for collapsed-by-default project groups and click-to-focus headers,
+// see fork/docs/11. `sidebar.rs` no longer imports `Modifiers`, which upstream
+// tests above reach through `use super::*`.
+use gpui::Modifiers;
+
+async fn fork_setup_two_projects(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<MultiWorkspace>,
+    Entity<Sidebar>,
+    Entity<Workspace>,
+    Entity<Workspace>,
+    &mut gpui::VisualTestContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", serde_json::json!({ "src": {} }))
+        .await;
+    fs.insert_tree("/project-b", serde_json::json!({ "src": {} }))
+        .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project_a = project::Project::test(fs.clone(), ["/project-a".as_ref()], cx).await;
+    let project_b = project::Project::test(fs.clone(), ["/project-b".as_ref()], cx).await;
+    let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+        let mut multi_workspace = MultiWorkspace::test_new(project_a, window, cx);
+        multi_workspace.fork_set_new_groups_expanded(false);
+        multi_workspace
+    });
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+    (multi_workspace, sidebar, workspace_a, workspace_b, cx)
+}
+
+fn fork_header_index(
+    sidebar: &Entity<Sidebar>,
+    label: &str,
+    cx: &mut gpui::VisualTestContext,
+) -> usize {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::ProjectHeader { label: header_label, .. } if header_label.as_ref() == label)
+            })
+            .expect("project header should be visible in sidebar")
+    })
+}
+
+fn fork_click_entry(
+    sidebar: &Entity<Sidebar>,
+    entry_index: usize,
+    modifiers: Modifiers,
+    cx: &mut gpui::VisualTestContext,
+) {
+    cx.draw(
+        gpui::point(px(0.), px(0.)),
+        gpui::size(px(400.), px(400.)),
+        |_, _| sidebar.clone().into_any_element(),
+    );
+    let entry_bounds = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .list_state
+            .bounds_for_item(entry_index)
+            .expect("sidebar entry should be measured")
+    });
+    // Click on the label, away from the hover buttons on the right.
+    let position = gpui::point(
+        entry_bounds.origin.x + px(20.),
+        entry_bounds.origin.y + entry_bounds.size.height / 2.,
+    );
+    cx.simulate_click(position, modifiers);
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_fork_new_project_groups_start_collapsed(cx: &mut TestAppContext) {
+    let (_multi_workspace, sidebar, _workspace_a, _workspace_b, cx) =
+        fork_setup_two_projects(cx).await;
+
+    let mut entries = visible_entries_as_strings(&sidebar, cx);
+    entries.sort();
+    assert_eq!(entries, vec!["> [project-a]", "> [project-b]"]);
+}
+
+#[gpui::test]
+async fn test_fork_click_project_header_focuses_project(cx: &mut TestAppContext) {
+    let (multi_workspace, sidebar, workspace_a, workspace_b, cx) =
+        fork_setup_two_projects(cx).await;
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone()),
+        workspace_b
+    );
+
+    let header_a = fork_header_index(&sidebar, "project-a", cx);
+    fork_click_entry(&sidebar, header_a, Modifiers::none(), cx);
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone()),
+        workspace_a
+    );
+    let mut entries = visible_entries_as_strings(&sidebar, cx);
+    entries.sort();
+    assert_eq!(entries, vec!["> [project-a]", "> [project-b]"]);
+}
+
+#[gpui::test]
+async fn test_fork_secondary_click_project_header_toggles_collapse(cx: &mut TestAppContext) {
+    let (multi_workspace, sidebar, _workspace_a, workspace_b, cx) =
+        fork_setup_two_projects(cx).await;
+    let secondary = cx.update(|_window, cx| Modifiers::secondary_key(cx));
+
+    let header_a = fork_header_index(&sidebar, "project-a", cx);
+    fork_click_entry(&sidebar, header_a, secondary, cx);
+
+    let header_a = fork_header_index(&sidebar, "project-a", cx);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx)[header_a],
+        "v [project-a]"
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone()),
+        workspace_b,
+        "secondary-click should not switch workspaces"
+    );
+
+    fork_click_entry(&sidebar, header_a, secondary, cx);
+    let mut entries = visible_entries_as_strings(&sidebar, cx);
+    entries.sort();
+    assert_eq!(entries, vec!["> [project-a]", "> [project-b]"]);
+}
+
+#[gpui::test]
+async fn test_fork_keyboard_confirm_on_project_header_focuses_project(cx: &mut TestAppContext) {
+    let (multi_workspace, sidebar, workspace_a, _workspace_b, cx) =
+        fork_setup_two_projects(cx).await;
+
+    focus_sidebar(&sidebar, cx);
+    let header_a = fork_header_index(&sidebar, "project-a", cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(header_a);
+    });
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone()),
+        workspace_a
+    );
+    let mut entries = visible_entries_as_strings(&sidebar, cx);
+    entries.sort();
+    assert_eq!(entries, vec!["> [project-a]", "> [project-b]"]);
 }

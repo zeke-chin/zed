@@ -321,6 +321,8 @@ pub struct MultiWorkspace {
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
+    // FORK: whether newly created project groups start expanded, see fork/docs/11.
+    fork_new_groups_expanded: bool,
 }
 
 impl EventEmitter<MultiWorkspaceEvent> for MultiWorkspace {}
@@ -383,6 +385,7 @@ impl MultiWorkspace {
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
+            fork_new_groups_expanded: false,
         }
     }
 
@@ -691,7 +694,7 @@ impl MultiWorkspace {
             0,
             ProjectGroupState {
                 key,
-                expanded: true,
+                expanded: self.fork_new_groups_expanded,
             },
         );
     }
@@ -1657,7 +1660,16 @@ impl MultiWorkspace {
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = cx.new(|cx| Workspace::test_new(project, window, cx));
-        Self::new(workspace, window, cx)
+        let mut this = Self::new(workspace, window, cx);
+        // FORK: upstream tests expect new groups to start expanded.
+        this.fork_new_groups_expanded = true;
+        this
+    }
+
+    // FORK: lets fork tests opt into the collapsed-by-default behavior.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fork_set_new_groups_expanded(&mut self, expanded: bool) {
+        self.fork_new_groups_expanded = expanded;
     }
 
     #[cfg(any(test, feature = "test-support"))]
