@@ -25,6 +25,9 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H15 | `crates/markdown_preview/src/markdown_preview_view.rs` | `render_markdown_element` 里原本内联构造 `MarkdownStyle` 的三行换成 `fork_markdown_preview::preview_markdown_style(preview_theme.as_ref(), window, cx)` | `fork.markdown_preview.style = "vditor"` 的入口。用新 crate 包一层而不是内联分支，样式翻译全部留在 fork 里 |
 | H15 | `crates/markdown_preview/Cargo.toml` | 加 `fork_markdown_preview` 依赖 | 同上 |
 | H16 | `crates/markdown/src/markdown.rs` | `MarkdownStyle` 加 `list_layout` / `table_layout` / `heading_layout` / `code_block_layout` / `inline_code_layout` / `block_quote_layout` / `rule_height` 七个字段，并把标题边距、列表缩进与符号、表格边框与斑马纹、代码块与 chip 圆角、引用块左边框、分隔线高度改成读这些字段 | Vditor 的排版和上游硬编码的值不同（列表缩进 2em vs 10px、表格无外框、斑马纹在表体）。字段默认值等于上游原值，所以不设时行为完全不变 |
+| H17 | `crates/workspace/src/multi_workspace.rs` | `MultiWorkspace` 加字段 `fork_new_groups_expanded`（`new` 里为 `false`），`ensure_project_group_state` 新建分组时用它代替 `expanded: true`；`test_new` 把它设为 `true`，另加测试用的 `fork_set_new_groups_expanded` | 侧边栏新项目分组默认折叠（设计文档 11）。`ensure_project_group_state` 是分组状态唯一的创建入口。上游测试都经 `test_new` 构造且大量断言默认展开，让 `test_new` 保持上游行为，上游测试就不用改 |
+| H18 | `crates/sidebar/src/sidebar.rs` | `render_project_header` 的 `on_click` 对调两个分支（单击切到项目，⌘-单击展开/折叠）；`confirm` 落在项目标题上改为切到项目；`…` 菜单「Focus Project」的快捷提示从「⌘-click」改成「click」，并删掉因此不再用的 `Modifiers`、`render_modifiers` 导入 | 把侧边栏当工作区切换器用（设计文档 11） |
+| H19 | `crates/sidebar/src/sidebar_tests.rs` | 末尾追加 fork 测试（含补回 `use gpui::Modifiers;`，H18 删了 `sidebar.rs` 里的导入，上游测试靠 `use super::*` 用到它）；上游 `test_keyboard_confirm_on_project_header_toggles_collapse` 按新行为改写 | 同上；Enter 的行为改了，上游这条测试只能跟着改 |
 
 计划中的挂钩（还没落地）：
 
@@ -52,4 +55,7 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H14 | 接受上游版本，在 `impl Repository` 里重新加 `fork_rescan`；`schedule_scan` 的签名或 `GitStoreState::Local` 的结构变了时按编译错误调整 |
 | H15 | 接受上游版本，在 `render_markdown_element` 里重新替换那三行；`preview_theme` 的类型或 `themed_with_overrides` 签名变了就同步调整 `fork_markdown_preview::preview_markdown_style` |
 | H16 | 接受上游版本，重新加 7 个字段和各处的 `// FORK:` 判断。上游改了字段默认值或这几处渲染结构时，保证 `None` 仍然还原成上游原值 |
+| H17 | 接受上游版本，重新加字段并在 `new`、`test_new`、`ensure_project_group_state` 里补回。上游新增了别的分组创建入口时，也要让它读 `fork_new_groups_expanded` |
+| H18 | 接受上游版本，重新对调 `on_click` 的两个分支、改回 `confirm` 的标题分支和菜单提示。上游改了这几处的结构时按设计文档 11 的行为重做 |
+| H19 | 接受上游版本，重新追加文件末尾的 fork 测试段；被改写的那条上游测试再按新行为改一次 |
 | `README.md` | 接受上游版本，重新把 `> [!IMPORTANT]` 两行加回文件开头。这两行由人工删除，冲突时不要跟着上游丢掉 |
