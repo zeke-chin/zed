@@ -23,6 +23,8 @@ gpui.workspace = true
 language.workspace = true
 log.workspace = true
 markdown.workspace = true
+# FORK: `fork.markdown_preview.style` typography for the preview.
+fork_markdown_preview.workspace = true
 project.workspace = true
 settings.workspace = true
 theme.workspace = true

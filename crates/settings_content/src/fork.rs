@@ -21,6 +21,28 @@ pub struct ForkSettingsContent {
     pub json_explorer: Option<JsonExplorerSettingsContent>,
     pub windsurf: Option<WindsurfSettingsContent>,
     pub git_panel: Option<ForkGitPanelSettingsContent>,
+    pub markdown_preview: Option<ForkMarkdownPreviewSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ForkMarkdownPreviewSettingsContent {
+    /// Which typography the markdown preview uses.
+    ///
+    /// Default: zed
+    pub style: Option<ForkMarkdownPreviewStyle>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkMarkdownPreviewStyle {
+    /// Upstream typography.
+    #[default]
+    Zed,
+    /// Vditor's typography, as used by the cweijan/vscode-office extension.
+    Vditor,
 }
 
 #[derive(

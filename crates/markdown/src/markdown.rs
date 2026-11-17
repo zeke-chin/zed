@@ -105,6 +105,107 @@ pub struct HeadingLevelStyles {
     pub h6: Option<TextStyleRefinement>,
 }
 
+// FORK: layout knobs opened up so `fork_markdown_preview` can reproduce
+// Vditor's typography. Every default keeps the value upstream hardcoded.
+/// Bullet glyphs for unordered lists, chosen per nesting depth. Deeper lists
+/// reuse the last entry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ListBullet {
+    Disc,
+    Circle,
+    Square,
+}
+
+/// How lists are indented and which glyphs they use.
+#[derive(Clone)]
+pub struct ListLayoutStyle {
+    /// Left padding of every list container, in whichever unit is set. `None`
+    /// keeps the upstream value.
+    pub indent: Option<DefiniteLength>,
+    /// Bullet glyphs for unordered lists, indexed by nesting depth. `None`
+    /// draws the upstream `•` at every depth.
+    pub bullets: Option<Vec<ListBullet>>,
+    /// Gap between an item's bullet and its text.
+    pub bullet_gap: Pixels,
+    /// Bottom margin between sibling items.
+    pub item_spacing: Pixels,
+}
+
+impl Default for ListLayoutStyle {
+    fn default() -> Self {
+        Self {
+            indent: None,
+            bullets: None,
+            bullet_gap: px(4.),
+            item_spacing: px(4.),
+        }
+    }
+}
+
+/// How table rows and cells are framed and shaded.
+#[derive(Clone, Default)]
+pub struct TableLayoutStyle {
+    /// Half of the outer border width; the table draws it on both sides.
+    pub outer_border_width: Option<Pixels>,
+    pub outer_border_color: Option<Hsla>,
+    pub outer_corner_radius: Option<Pixels>,
+    pub outer_border_visible: bool,
+    /// Border drawn between cells.
+    pub cell_border_width: Option<Pixels>,
+    pub cell_border_color: Option<Hsla>,
+    /// Shading of the header row.
+    pub header_background: Option<Hsla>,
+    /// Shading of every second body row, counted from the first body row.
+    pub body_stripe_background: Option<Hsla>,
+    /// Shading of body rows that carry no stripe.
+    pub body_background: Option<Hsla>,
+}
+
+/// Padding above and below headings, and which levels get a bottom rule.
+#[derive(Clone, Default)]
+pub struct HeadingLayoutStyle {
+    /// Margin above headings other than the first level.
+    pub margin_top: Option<DefiniteLength>,
+    pub margin_bottom: Option<DefiniteLength>,
+    /// Space between a heading and its bottom rule. `None` keeps the upstream
+    /// per-level values.
+    pub border_padding: Option<DefiniteLength>,
+    /// Levels that draw a bottom rule when `heading_border_color` is set.
+    pub border_levels: Option<Vec<pulldown_cmark::HeadingLevel>>,
+}
+
+impl HeadingLayoutStyle {
+    /// Whether `level` draws a bottom rule when `heading_border_color` is set.
+    pub fn draws_border(&self, level: pulldown_cmark::HeadingLevel) -> bool {
+        match &self.border_levels {
+            Some(levels) => levels.contains(&level),
+            None => matches!(
+                level,
+                pulldown_cmark::HeadingLevel::H1 | pulldown_cmark::HeadingLevel::H2
+            ),
+        }
+    }
+}
+
+/// Rounding and padding of fenced code blocks.
+#[derive(Clone, Default)]
+pub struct CodeBlockLayoutStyle {
+    pub corner_radius: Option<Pixels>,
+}
+
+/// Rounding of the background painted behind inline code.
+#[derive(Clone, Default)]
+pub struct InlineCodeLayoutStyle {
+    pub corner_radius: Option<Pixels>,
+}
+
+/// Left border of block quotes.
+#[derive(Clone, Default)]
+pub struct BlockQuoteLayoutStyle {
+    /// Width of the left border. `None` keeps the upstream 4px.
+    pub border_width: Option<Pixels>,
+}
+
 #[derive(Clone)]
 pub struct MarkdownStyle {
     pub base_text_style: TextStyle,
@@ -129,6 +230,14 @@ pub struct MarkdownStyle {
     pub list_spacing: Pixels,
     /// Horizontal (`x`) and vertical (`y`) padding of table cells
     pub table_cell_padding: Point<Pixels>,
+    pub list_layout: ListLayoutStyle,
+    pub table_layout: TableLayoutStyle,
+    pub heading_layout: HeadingLayoutStyle,
+    pub code_block_layout: CodeBlockLayoutStyle,
+    pub inline_code_layout: InlineCodeLayoutStyle,
+    pub block_quote_layout: BlockQuoteLayoutStyle,
+    /// Height of the horizontal rule. `None` keeps the upstream 1px.
+    pub rule_height: Option<Pixels>,
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
@@ -159,6 +268,13 @@ impl Default for MarkdownStyle {
             paragraph_line_height: rems(1.3).into(),
             list_spacing: px(0.),
             table_cell_padding: point(px(4.), px(2.)),
+            list_layout: ListLayoutStyle::default(),
+            table_layout: TableLayoutStyle::default(),
+            heading_layout: HeadingLayoutStyle::default(),
+            code_block_layout: CodeBlockLayoutStyle::default(),
+            inline_code_layout: InlineCodeLayoutStyle::default(),
+            block_quote_layout: BlockQuoteLayoutStyle::default(),
+            rule_height: None,
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
@@ -2131,6 +2247,7 @@ impl MarkdownElement {
             level,
             self.style.heading_level_styles.as_ref(),
             self.style.heading_border_color,
+            &self.style.heading_layout,
         );
 
         heading = match align {
@@ -2201,7 +2318,11 @@ impl MarkdownElement {
         let block_div = div()
             .pl_4()
             .mb(self.style.paragraph_spacing)
-            .border_l_4()
+            // FORK: Vditor's quote rule is 0.25em, not 4px.
+            .map(|this| match self.style.block_quote_layout.border_width {
+                Some(width) => this.border_l(width),
+                None => this.border_l_4(),
+            })
             .border_color(border_color);
         let block_div = match header {
             Some(header) => block_div.child(header),
@@ -2332,11 +2453,14 @@ impl MarkdownElement {
         range: &Range<usize>,
         markdown_end: usize,
     ) {
+        // FORK: Vditor spaces list items by 0.25em.
+        let item_spacing = self.style.list_layout.item_spacing;
+        let bullet_gap = self.style.list_layout.bullet_gap;
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1()
-                        .gap_1()
+                    el.mb(item_spacing)
+                        .gap(bullet_gap)
                         .line_height(self.style.paragraph_line_height)
                 })
                 .h_flex()
@@ -2717,6 +2841,10 @@ impl Element for MarkdownElement {
             self.style.syntax.clone(),
             highlights,
             parsed_markdown.first_rendered_block_start(),
+            self.style
+                .inline_code_layout
+                .corner_radius
+                .unwrap_or_else(|| px(4.)),
         );
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
             last.0.end
@@ -2957,7 +3085,15 @@ impl Element for MarkdownElement {
 
                                     let code_block = div()
                                         .id(("code-block", range.start))
-                                        .rounded_lg()
+                                        .map(|code_block| {
+                                            if let Some(radius) =
+                                                self.style.code_block_layout.corner_radius
+                                            {
+                                                code_block.rounded(radius)
+                                            } else {
+                                                code_block.rounded_lg()
+                                            }
+                                        })
                                         .map(|code_block| {
                                             if let Some(scroll_handle) = scroll_handle.as_ref() {
                                                 code_block
@@ -2987,9 +3123,14 @@ impl Element for MarkdownElement {
                         MarkdownTag::List(bullet_index) => {
                             builder.push_list(*bullet_index);
                             let is_top_level = builder.list_stack.len() == 1;
+                            // FORK: Vditor indents lists by 2em.
+                            let indent = self.style.list_layout.indent;
                             builder.push_div(
                                 div()
-                                    .pl_2p5()
+                                    .map(|this: Div| match indent {
+                                        Some(indent) => this.pl(indent),
+                                        None => this.pl_2p5(),
+                                    })
                                     .when(is_top_level, |this| this.mb(self.style.list_spacing)),
                                 range,
                                 markdown_end,
@@ -3032,7 +3173,20 @@ impl Element for MarkdownElement {
                             } else if let Some(bullet_index) = builder.next_bullet_index() {
                                 div().child(format!("{}.", bullet_index)).into_any_element()
                             } else {
-                                div().child("•").into_any_element()
+                                let depth = builder.list_stack.len().saturating_sub(1);
+                                let glyph = self
+                                    .style
+                                    .list_layout
+                                    .bullets
+                                    .as_ref()
+                                    .and_then(|bullets| bullets.get(depth).or(bullets.last()));
+                                let glyph = match glyph {
+                                    Some(ListBullet::Disc) => "•",
+                                    Some(ListBullet::Circle) => "◦",
+                                    Some(ListBullet::Square) => "▪",
+                                    None => "•",
+                                };
+                                div().child(glyph).into_any_element()
                             };
                             self.push_markdown_list_item(&mut builder, bullet, range, markdown_end);
                         }
@@ -3113,6 +3267,8 @@ impl Element for MarkdownElement {
                         MarkdownTag::Table(alignments) => {
                             builder.table.start(alignments.clone());
 
+                            // FORK: Vditor's table has no outer frame.
+                            let table_layout = self.style.table_layout.clone();
                             let column_count = alignments.len();
                             builder.push_div(div().flex(), range, markdown_end);
                             builder.push_div(
@@ -3128,9 +3284,23 @@ impl Element for MarkdownElement {
                                         this.grid_cols_max_content(column_count as u16)
                                     })
                                     .mb_2()
-                                    .border(px(1.5))
-                                    .border_color(cx.theme().colors().border)
-                                    .rounded_sm()
+                                    .when(!table_layout.outer_border_visible, |this| {
+                                        this.border_0()
+                                    })
+                                    .when(table_layout.outer_border_visible, |this| {
+                                        let border_width = table_layout
+                                            .outer_border_width
+                                            .unwrap_or(px(1.5));
+                                        this.border(border_width).border_color(
+                                            table_layout
+                                                .outer_border_color
+                                                .unwrap_or_else(|| cx.theme().colors().border),
+                                        )
+                                    })
+                                    .map(|this| match table_layout.outer_corner_radius {
+                                        Some(radius) => this.rounded(radius),
+                                        None => this.rounded_sm(),
+                                    })
                                     .restrict_scroll_to_axis()
                                     .custom_scrollbars(
                                         Scrollbars::new(ScrollAxes::Horizontal)
@@ -3163,6 +3333,27 @@ impl Element for MarkdownElement {
                                 .and_then(alignment_to_text_align)
                                 .unwrap_or(self.style.base_text_style.text_align);
 
+                            // FORK: Vditor's stripes are on body rows only.
+                            let table_layout = self.style.table_layout.clone();
+                            let cell_border_width = table_layout
+                                .cell_border_width
+                                .unwrap_or(px(1.));
+                            let cell_border_color = table_layout
+                                .cell_border_color
+                                .unwrap_or_else(|| cx.theme().colors().border);
+                            // Row 0 is the header; body rows count from row 1, so
+                            // odd rows are the second, fourth, ... body rows. `None`
+                            // here means "leave the default shading in place".
+                            let body_row_background = if is_header {
+                                None
+                            } else if row_index % 2 == 1 {
+                                table_layout
+                                    .body_stripe_background
+                                    .or_else(|| Some(cx.theme().colors().panel_background))
+                            } else {
+                                table_layout.body_background
+                            };
+
                             let mut cell_div = div()
                                 .debug_selector(|| {
                                     if is_header {
@@ -3174,16 +3365,26 @@ impl Element for MarkdownElement {
                                 .flex()
                                 .flex_col()
                                 .h_full()
-                                .when(col_index > 0, |this| this.border_l_1())
-                                .when(row_index > 0, |this| this.border_t_1())
-                                .border_color(cx.theme().colors().border)
+                                .when(col_index > 0, |this| {
+                                    this.border_l(cell_border_width)
+                                })
+                                .when(row_index > 0, |this| {
+                                    this.border_t(cell_border_width)
+                                })
+                                .border_color(cell_border_color)
                                 .px(self.style.table_cell_padding.x)
                                 .py(self.style.table_cell_padding.y)
                                 .when(is_header, |this| {
-                                    this.bg(cx.theme().colors().title_bar_background)
+                                    this.bg(table_layout.header_background.unwrap_or_else(|| {
+                                        cx.theme().colors().title_bar_background
+                                    }))
                                 })
-                                .when(!is_header && row_index % 2 == 1, |this| {
-                                    this.bg(cx.theme().colors().panel_background)
+                                .when(!is_header, |this| {
+                                    if let Some(background) = body_row_background {
+                                        this.bg(background)
+                                    } else {
+                                        this
+                                    }
                                 });
 
                             cell_div = match alignment {
@@ -3419,7 +3620,11 @@ impl Element for MarkdownElement {
                 MarkdownEvent::Rule => {
                     builder.push_div(
                         div()
-                            .border_b_1()
+                            // FORK: Vditor's rule is 2px tall.
+                            .map(|this| match self.style.rule_height {
+                                Some(height) => this.border_b(height),
+                                None => this.border_b_1(),
+                            })
                             .my(self.style.paragraph_spacing)
                             .border_color(self.style.rule_color),
                         range,
@@ -3585,6 +3790,7 @@ fn apply_heading_style(
     level: pulldown_cmark::HeadingLevel,
     custom_styles: Option<&HeadingLevelStyles>,
     border_color: Option<Hsla>,
+    layout: &HeadingLayoutStyle,
 ) -> Div {
     heading = match level {
         pulldown_cmark::HeadingLevel::H1 => heading.text_3xl(),
@@ -3595,21 +3801,30 @@ fn apply_heading_style(
         pulldown_cmark::HeadingLevel::H6 => heading.text_sm(),
     };
 
-    heading = match level {
-        pulldown_cmark::HeadingLevel::H1 => heading,
-        _ => heading.mt_6(),
+    heading = match (level, layout.margin_top) {
+        (_, Some(margin_top)) => heading.mt(margin_top),
+        // Upstream leaves H1 without an extra top margin; the caller already
+        // sets `mt_4` on every heading.
+        (pulldown_cmark::HeadingLevel::H1, None) => heading,
+        (_, None) => heading.mt_6(),
     };
 
-    if let Some(border_color) = border_color {
-        heading = match level {
-            pulldown_cmark::HeadingLevel::H1 => {
-                heading.pb_2().border_b_1().border_color(border_color)
-            }
-            pulldown_cmark::HeadingLevel::H2 => {
-                heading.pb_1().border_b_1().border_color(border_color)
-            }
-            _ => heading,
+    if let Some(margin_bottom) = layout.margin_bottom {
+        heading = heading.mb(margin_bottom);
+    }
+
+    if let Some(border_color) = border_color
+        && layout.draws_border(level)
+    {
+        heading = match layout.border_padding {
+            Some(border_padding) => heading.pb(border_padding),
+            None => match level {
+                pulldown_cmark::HeadingLevel::H1 => heading.pb_2(),
+                pulldown_cmark::HeadingLevel::H2 => heading.pb_1(),
+                _ => heading,
+            },
         };
+        heading = heading.border_b_1().border_color(border_color);
     }
 
     if let Some(style) = heading_level_style(level, custom_styles) {
@@ -3859,6 +4074,7 @@ struct MarkdownElementBuilder {
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
     highlights: MarkdownHighlights,
+    chip_corner_radius: Pixels,
 }
 
 struct MarkdownHighlights {
@@ -3956,6 +4172,7 @@ impl MarkdownElementBuilder {
         syntax_theme: Arc<SyntaxTheme>,
         highlights: MarkdownHighlights,
         first_block_start: usize,
+        chip_corner_radius: Pixels,
     ) -> Self {
         Self {
             div_stack: vec![{
@@ -3980,6 +4197,7 @@ impl MarkdownElementBuilder {
             table: TableState::default(),
             syntax_theme,
             highlights,
+            chip_corner_radius,
         }
     }
 
@@ -4365,6 +4583,7 @@ impl MarkdownElementBuilder {
             text_align: TextAlign::Left,
             highlights: SmallVec::new(),
             code_chips: SmallVec::new(),
+            chip_corner_radius: self.chip_corner_radius,
         }));
         div()
             .absolute()
@@ -4404,6 +4623,7 @@ impl MarkdownElementBuilder {
             text_align,
             highlights,
             code_chips: line.code_chips.into_iter().collect(),
+            chip_corner_radius: self.chip_corner_radius,
         });
         self.rendered_lines.push(rendered_line.clone());
         self.append_child(
@@ -4504,13 +4724,12 @@ struct RenderedLine {
     highlights: SmallVec<[(Range<usize>, Hsla); 1]>,
     /// Inline code chip ranges intersecting this line, in rendered indices
     code_chips: SmallVec<[(Range<usize>, Hsla); 1]>,
+    chip_corner_radius: Pixels,
 }
 
 impl RenderedLine {
     /// Painted before the glyphs so the text renders on top of the chips
     fn paint_code_chips(&self, window: &mut Window) {
-        const CHIP_CORNER_RADIUS: Pixels = px(4.);
-
         if self.code_chips.is_empty() {
             return;
         }
@@ -4542,7 +4761,7 @@ impl RenderedLine {
                     };
                     window.paint_quad(quad(
                         chip_bounds,
-                        CHIP_CORNER_RADIUS,
+                        self.chip_corner_radius,
                         *color,
                         Edges::default(),
                         Hsla::transparent_black(),

@@ -22,8 +22,8 @@ use gpui::{
 };
 use language::{Buffer, LanguageRegistry};
 use markdown::{
-    CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
-    MarkdownOptions, MarkdownStyle,
+    CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement,
+    MarkdownOptions,
 };
 use project::search::SearchQuery;
 use project::{Project, ProjectPath, image_store};
@@ -1104,17 +1104,12 @@ impl MarkdownPreviewView {
             project = Some(project_entity);
         }
 
-        let markdown_style = if let Some(theme) = preview_theme {
-            MarkdownStyle::themed_with_overrides(
-                MarkdownFont::Preview,
-                theme.colors(),
-                theme.syntax(),
-                window,
-                cx,
-            )
-        } else {
-            MarkdownStyle::themed(MarkdownFont::Preview, window, cx)
-        };
+        // FORK: `fork.markdown_preview.style` swaps the preview's typography.
+        let markdown_style = fork_markdown_preview::preview_markdown_style(
+            preview_theme.as_ref(),
+            window,
+            cx,
+        );
 
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
             .input_focus_handle(self.focus_handle.clone())

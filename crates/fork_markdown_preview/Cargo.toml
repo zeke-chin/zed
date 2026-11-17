@@ -1,0 +1,26 @@
+[package]
+name = "fork_markdown_preview"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fork_markdown_preview.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+markdown.workspace = true
+pulldown-cmark.workspace = true
+settings.workspace = true
+theme.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+theme = { workspace = true, features = ["test-support"] }
+theme_settings.workspace = true
