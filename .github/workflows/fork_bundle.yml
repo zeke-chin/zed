@@ -3,7 +3,13 @@
 # 不带签名、公证和 Sentry 相关 secrets，脚本会自动走未签名 / 本地临时签名路径。
 name: fork_bundle
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ref:
+        # workflow_dispatch 只能选带有本文件的分支；没合入本文件的分支（如功能分支）通过这里指定。
+        description: 要构建的分支、tag 或提交，留空则构建触发时选的分支
+        type: string
+        default: ''
   push:
     tags:
     - fork-v*
@@ -13,10 +19,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
   CARGO_INCREMENTAL: '0'
-  # 与 fork/bundle.sh 一致：「关于」里的提交号带 -fork 后缀，crates/zed/build.rs 原样传给 rustc-env。
-  ZED_COMMIT_SHA: ${{ github.sha }}-fork
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 jobs:
   bundle_linux:
@@ -48,6 +52,11 @@ jobs:
         df -h /
     - name: checkout_repo
       uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+    - name: set_commit_sha
+      # 与 fork/bundle.sh 一致：「关于」里的提交号带 -fork 后缀，crates/zed/build.rs 原样传给 rustc-env。
+      run: echo "ZED_COMMIT_SHA=$(git rev-parse HEAD)-fork" >> "$GITHUB_ENV"
     - name: setup_linux
       run: ./script/linux
     - name: download_wasi_sdk
@@ -83,6 +92,11 @@ jobs:
     steps:
     - name: checkout_repo
       uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+    - name: set_commit_sha
+      # 与 fork/bundle.sh 一致：「关于」里的提交号带 -fork 后缀，crates/zed/build.rs 原样传给 rustc-env。
+      run: echo "ZED_COMMIT_SHA=$(git rev-parse HEAD)-fork" >> "$GITHUB_ENV"
     - name: setup_node
       # bundle-mac 会 npm install --global dmg-license。
       uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
@@ -131,6 +145,13 @@ jobs:
       run: git config --system core.longpaths true
     - name: checkout_repo
       uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+    - name: set_commit_sha
+      # 与 fork/bundle.sh 一致：「关于」里的提交号带 -fork 后缀，crates/zed/build.rs 原样传给 rustc-env。
+      run: |
+        $ErrorActionPreference = "Stop"
+        "ZED_COMMIT_SHA=$(git rev-parse HEAD)-fork" >> $env:GITHUB_ENV
     - name: set_release_version
       # CI 环境下 bundle-windows.ps1 要求 RELEASE_VERSION，官方由自建 runner 的环境提供。
       run: |
