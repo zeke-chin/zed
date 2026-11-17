@@ -70,13 +70,28 @@ impl<Label: Ord + Clone> RootPathTrie<Label> {
                 Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
             };
         }
-        let _previous_value = current.labels.insert(value, presence);
-        debug_assert_eq!(_previous_value, None);
+        let previous_value = current.labels.insert(value, presence);
+        // FORK: A newly discovered root may have been negatively cached (H25).
+        debug_assert!(matches!(
+            (previous_value, presence),
+            (None, _) | (Some(LabelPresence::KnownAbsent), LabelPresence::Present)
+        ));
         current
     }
 
     pub fn insert(&mut self, path: &TriePath, value: Label, presence: LabelPresence) {
-        self.insert_inner(path, value, presence);
+        let current = self.insert_inner(path, value.clone(), presence);
+        if presence == LabelPresence::Present {
+            // FORK: Negative descendant caches assumed no ancestor root existed (H25).
+            // Keep nested roots and other manifest labels, which remain valid.
+            let mut descendants: Vec<_> = current.children.values_mut().collect();
+            while let Some(descendant) = descendants.pop() {
+                if descendant.labels.get(&value) == Some(&LabelPresence::KnownAbsent) {
+                    descendant.labels.remove(&value);
+                }
+                descendants.extend(descendant.children.values_mut());
+            }
+        }
     }
 
     pub fn walk<'a>(

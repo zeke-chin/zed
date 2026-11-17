@@ -33,6 +33,8 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H22 | `crates/project/src/git_store.rs` | 在 `fork_rescan` 附近加 `fork_load_revision_texts` | 使用本地已有的批量 revision 读取、文本解码和 object read limiter；不扩展远程协议，拒绝二进制和超过 2 MB 的版本 |
 | H23 | `crates/git_ui/src/blame_ui.rs` | 声明 fork 子模块；popover 渲染入口按设置提前分发 | 默认仍走上游布局，fork 布局复用 crate 内部的头像、时间和 CommitView |
 | H24 | `crates/git_ui/src/blame_ui/fork_gitlens_popover.rs` | **新文件**，GitLens 布局、异步 diff、64 项 LRU 缓存和测试 | fork 自有逻辑不散落到上游；缓存包含父 SHA/旧路径并隔离被淘汰任务的异步结果 |
+| H25 | `crates/project/src/manifest_tree/path_trie.rs` | 新发现项目根时允许从 `KnownAbsent` 升级，并清除同一 manifest 标签在后代中的否定缓存；保留嵌套项目根和其他标签 | 避免启动时 LSP 项目根查询遇到 `Present → KnownAbsent` 的旧缓存而触发断言 |
+| H25 | `crates/project/tests/integration/manifest_tree.rs` | 追加项目根缓存升级和后代清理的回归测试 | 覆盖工作树根、嵌套根、多标签和不相关分支 |
 
 计划中的挂钩（还没落地）：
 
@@ -54,7 +56,7 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H8 | 接受上游版本，在 `load_default_keymap` 末尾重新加一行；如果上游改了默认键位的加载流程，保证 fork 键位仍在每次重新加载时、用户键位之前绑定 |
 | H9 | 接受上游版本，在 `SettingsContent { … }` 字面量末尾重新加 `fork: None`。上游给 `SettingsContent` 加字段时这里最容易冲突，编译器会报 `missing field` |
 | H10 | 接受上游版本（上游 tag 之间这个文件一般不变），重新改成 `dev` |
-| H11 | `crates/git_ui/src/git_panel.rs` | `mod fork_vscode_layout;`；`GitPanel` 加字段 `fork_layout` 并在 `new` 里初始化；`set_active_tab` 开头先调 `fork_set_active_tab`，返回 `true` 即结束；`load_commit_history` 的订阅和 `set_active_repository` 里两处 `active_tab == GitPanelTab::History` 换成 `fork_history_is_shown(cx)`；`Render` 开头算出 `fork_body`，有值时不画标签栏，并在 `match self.active_tab` 前加一个分支直接放入 `fork_body`；`render_list_header`、`render_status_entry`、`render_directory_entry` 里调 `fork_render_*_actions`（`render_list_header` 的分组名另调 `fork_section_title`），`git_panel_view_options_menu` 在 VS Code 布局下隐藏「Tracked & Untracked」分组选项；`change_file_stage`、`change_all_files_stage`、提交和 `perform_checkout` 完成后调 `fork_rescan_repository`；`fetch_commit_history_entries` 把取到的历史经 `fork_limit_history` 截成已显示的页数；`handle_font_size_action` 先调 `fork_handle_font_size_action`，VS Code 布局下以提交框显示字号为缩放起点（增减字号的入口传入 `Window`）；有值时放入它并隐藏数量 Chip、勾选框、增删行数和左侧状态图标，行加 `FORK_ENTRY_GROUP` 悬浮组 | Git 面板的 VS Code 式布局（设计文档 9）。标签页和历史加载逻辑都在 `GitPanel` 的私有方法里，只能用子模块访问，子模块必须在这个文件里声明 |
+| H11 | 接受上游版本，重新加上各处 `// FORK:` 标注的行。三个列表行渲染函数结构变了时，保证 VS Code 布局下仍用 fork 的行内按钮替换勾选框。上游新增了判断 `active_tab == GitPanelTab::History` 来决定是否加载或刷新历史的地方，也要换成 `fork_history_is_shown(cx)`；`Render` 的结构变了时，保证 VS Code 布局下不画标签栏和原来的正文 |
 | H12 | 新文件，不会冲突；按编译错误跟进 `GitPanel` 私有方法的改名或签名变化 |
 | H13 | 接受上游版本，在 `from_settings` 的 `group_by` 字段重新套上 `crate::git_panel::fork_group_by(content, …)` |
 | H14 | 接受上游版本，在 `impl Repository` 里重新加 `fork_rescan`；`schedule_scan` 的签名或 `GitStoreState::Local` 的结构变了时按编译错误调整 |
@@ -68,4 +70,5 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H22 | 接受上游版本，重新加本地批量读取函数；保留 object read limiter、文本解码和大小限制；远程仍直接报不支持 |
 | H23 | 接受上游版本，重新加模块声明和按设置分发；renderer 参数变化时同步 H24 的入口 |
 | H24 | fork 自有文件，不会冲突；按编译错误跟进头像、Markdown、CommitView、滚动条等 crate 内部接口变化 |
+| H25 | 接受上游版本；若上游仍未修复项目根的否定缓存失效问题，重加 `insert` 的后代清理、允许 `KnownAbsent → Present` 的断言条件及回归测试 |
 | `README.md` | 接受上游版本，重新把 `> [!IMPORTANT]` 两行加回文件开头。这两行由人工删除，冲突时不要跟着上游丢掉 |
