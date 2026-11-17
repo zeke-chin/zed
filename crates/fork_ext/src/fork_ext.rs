@@ -42,6 +42,7 @@ pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
     fork_copy_anchor::init(cx);
     fork_json_explorer::init(cx);
     fork_windsurf::init(cx);
+    fork_window_switcher::init(cx);
     observe_edit_prediction_settings(cx);
     cx.set_global(ForkHoverLinkHandler(handle_hover_link));
 

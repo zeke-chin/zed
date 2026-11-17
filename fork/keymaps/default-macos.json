@@ -16,5 +16,11 @@
     "bindings": {
       "cmd-;": "json_explorer::ToggleCurrentDocument"
     }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-cmd-w": "window_switcher::Toggle"
+    }
   }
 ]
