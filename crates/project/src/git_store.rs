@@ -7225,6 +7225,46 @@ impl Repository {
         }
     }
 
+    // FORK: H22. Keep revision reads local without adding a remote protocol message.
+    pub fn fork_load_revision_texts(
+        &self,
+        revisions: Vec<String>,
+        cx: &App,
+    ) -> Task<Result<Vec<Option<String>>>> {
+        let repository_state = self.repository_state.clone();
+        let object_read_limiter = self.object_read_limiter.clone();
+        cx.background_spawn(async move {
+            let _permit = object_read_limiter.acquire_arc().await;
+            let state = repository_state
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let RepositoryState::Local(LocalRepositoryState { backend, .. }) = state else {
+                anyhow::bail!("Blame hover revision reads are unavailable for remote repositories");
+            };
+            backend
+                .load_revisions(revisions)
+                .await?
+                .into_iter()
+                .map(|content| {
+                    content
+                        .map(|bytes| {
+                            anyhow::ensure!(
+                                bytes.len() <= 2 * 1024 * 1024,
+                                "Blame hover revision exceeds 2 MB"
+                            );
+                            let text = decode_git_text(bytes)?;
+                            anyhow::ensure!(
+                                text.len() <= 2 * 1024 * 1024,
+                                "Blame hover text exceeds 2 MB"
+                            );
+                            Ok(text)
+                        })
+                        .transpose()
+                })
+                .collect()
+        })
+    }
+
     pub fn show(&mut self, commit: String) -> oneshot::Receiver<Result<CommitDetails>> {
         let id = self.id;
         self.send_job("show", None, move |state, _cx| {
@@ -11965,6 +12005,38 @@ mod tests {
         // to the raw path).
         let resolved = resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/Foo/Bar")).await;
         assert_eq!(resolved, None);
+    }
+
+    // FORK: H22. NoopProtoClient panics on requests, so this also guards against remote IO.
+    #[gpui::test]
+    async fn test_fork_load_revision_texts_rejects_remote(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ ".git": {}, "a.txt": "text" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let git_store = project.read_with(cx, |project, _| project.git_store().downgrade());
+        let repository = cx.new(|cx| {
+            Repository::remote(
+                RepositoryId(1),
+                Path::new("/remote/project").into(),
+                None,
+                None,
+                PathStyle::Unix,
+                ProjectId(0),
+                rpc::NoopProtoClient::new().into(),
+                git_store,
+                Arc::new(Semaphore::new(1)),
+                cx,
+            )
+        });
+        let task = repository.read_with(cx, |repository, cx| {
+            repository.fork_load_revision_texts(vec!["HEAD:a.txt".into()], cx)
+        });
+        let error = task
+            .await
+            .expect_err("remote revision reads must be refused");
+        assert!(error.to_string().contains("remote repositories"));
     }
 
     #[gpui::test]
