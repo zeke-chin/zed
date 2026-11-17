@@ -124,6 +124,14 @@ pub struct ForkGitPanelSettingsContent {
     ///
     /// Default: tabs
     pub layout: Option<ForkGitPanelLayout>,
+    /// Whether the history in the VS Code layout shows tag badges.
+    ///
+    /// Default: true
+    pub show_tags: Option<bool>,
+    /// Whether the history in the VS Code layout shows remote branch badges.
+    ///
+    /// Default: true
+    pub show_remote_branches: Option<bool>,
 }
 
 #[derive(

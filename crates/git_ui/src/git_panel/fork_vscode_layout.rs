@@ -13,14 +13,17 @@ mod graph;
 
 use super::*;
 use gpui::{DragMoveEvent, FontWeight, Hsla, MouseUpEvent};
-use settings::{ForkGitPanelLayout, RegisterSetting, Settings, SettingsContent, SettingsStore};
+use settings::{
+    ForkGitPanelLayout, ForkGitPanelSettingsContent, RegisterSetting, Settings, SettingsContent,
+    SettingsStore,
+};
 
 /// Height of the history section when the user hasn't resized it, as a share
 /// of the panel height.
 const DEFAULT_HISTORY_FRACTION: f32 = 0.4;
 const MIN_SECTION_HEIGHT: Pixels = px(90.);
 const SECTION_HEADER_HEIGHT: Pixels = px(24.);
-const HISTORY_ROW_HEIGHT: Pixels = px(22.);
+const HISTORY_ROW_HEIGHT: Pixels = px(24.);
 const COMMIT_EDITOR_MAX_LINES: usize = 10;
 /// Wider graphs are clipped so the commit subjects stay readable.
 const MAX_GRAPH_LANES: usize = 6;
@@ -29,17 +32,26 @@ const MAX_REF_BADGES: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, RegisterSetting)]
 pub struct ForkGitPanelLayoutSettings {
     pub layout: ForkGitPanelLayout,
+    pub show_tags: bool,
+    pub show_remote_branches: bool,
 }
 
 impl Settings for ForkGitPanelLayoutSettings {
     fn from_settings(content: &SettingsContent) -> Self {
+        let git_panel = content
+            .fork
+            .as_ref()
+            .and_then(|fork| fork.git_panel.as_ref());
         Self {
-            layout: content
-                .fork
-                .as_ref()
-                .and_then(|fork| fork.git_panel.as_ref())
+            layout: git_panel
                 .and_then(|git_panel| git_panel.layout)
                 .unwrap_or_default(),
+            show_tags: git_panel
+                .and_then(|git_panel| git_panel.show_tags)
+                .unwrap_or(true),
+            show_remote_branches: git_panel
+                .and_then(|git_panel| git_panel.show_remote_branches)
+                .unwrap_or(true),
         }
     }
 }
@@ -514,9 +526,13 @@ impl GitPanel {
                     .on_action(|&zed_actions::editor::MoveDown, _, cx| cx.stop_propagation())
                     .child(EditorElement::new(&self.commit_editor, editor_style)),
             )
+            // As tall as the first line of text, so the buttons stay centered
+            // on it and don't move when the message grows.
             .child(
                 h_flex()
                     .flex_none()
+                    .h(font_size * 1.4 + px(4.))
+                    .items_center()
                     .gap_0p5()
                     .children(self.render_co_authors(cx))
                     .children(self.render_generate_commit_message_button(cx)),
@@ -579,11 +595,15 @@ impl GitPanel {
                                 Color::Default
                             },
                         ))
-                        .child(Label::new(title).size(LabelSize::Small).color(if disabled {
-                            Color::Disabled
-                        } else {
-                            Color::Default
-                        })),
+                        .child(
+                            Label::new(title)
+                                .size(LabelSize::Default)
+                                .color(if disabled {
+                                    Color::Disabled
+                                } else {
+                                    Color::Default
+                                }),
+                        ),
                 )
                 .tooltip({
                     let focus_handle = focus_handle.clone();
@@ -648,6 +668,7 @@ impl GitPanel {
         let actions = h_flex()
             .gap_0p5()
             .children(self.render_remote_button(cx))
+            .child(self.fork_render_graph_filter_menu())
             .child(
                 IconButton::new("fork-history-git-graph", IconName::GitGraph)
                     .icon_size(IconSize::Small)
@@ -728,6 +749,56 @@ impl GitPanel {
             })
     }
 
+    fn fork_render_graph_filter_menu(&self) -> impl IntoElement {
+        let fs = self.fs.clone();
+        PopoverMenu::new("fork-graph-filter-menu")
+            .trigger_with_tooltip(
+                IconButton::new("fork-graph-filter-trigger", IconName::Filter)
+                    .icon_size(IconSize::Small),
+                Tooltip::text("Graph Filters"),
+            )
+            .menu(move |window, cx| {
+                let settings = ForkGitPanelLayoutSettings::get_global(cx);
+                let show_tags = settings.show_tags;
+                let show_remote_branches = settings.show_remote_branches;
+                let fs = fs.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let set = |update: fn(&mut ForkGitPanelSettingsContent, bool), value: bool| {
+                        let fs = fs.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            update_settings_file(fs.clone(), cx, move |settings, _| {
+                                let git_panel = settings
+                                    .fork
+                                    .get_or_insert_default()
+                                    .git_panel
+                                    .get_or_insert_default();
+                                update(git_panel, value);
+                            });
+                        }
+                    };
+                    menu.header("Show in Graph")
+                        .toggleable_entry(
+                            "Tags",
+                            show_tags,
+                            IconPosition::Start,
+                            None,
+                            set(|s, v| s.show_tags = Some(v), !show_tags),
+                        )
+                        .toggleable_entry(
+                            "Remote Branches",
+                            show_remote_branches,
+                            IconPosition::Start,
+                            None,
+                            set(
+                                |s, v| s.show_remote_branches = Some(v),
+                                !show_remote_branches,
+                            ),
+                        )
+                }))
+            })
+            .anchor(Anchor::TopRight)
+    }
+
     fn fork_render_history_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let placeholder = |message: &'static str| {
             h_flex()
@@ -752,6 +823,7 @@ impl GitPanel {
             CommitHistory::Loaded(entries) => entries.clone(),
         };
 
+        let filter = *ForkGitPanelLayoutSettings::get_global(cx);
         let graph = self.fork_layout.graph.clone();
         let graph_lanes = graph
             .as_ref()
@@ -902,7 +974,7 @@ impl GitPanel {
                                             .child(
                                                 div().min_w_0().child(
                                                     Label::new(subject.clone())
-                                                        .size(LabelSize::Small)
+                                                        .size(LabelSize::Default)
                                                         .when(is_head, |label| {
                                                             label.weight(FontWeight::BOLD)
                                                         })
@@ -914,7 +986,7 @@ impl GitPanel {
                                                 this.child(
                                                     div().flex_shrink_0().max_w(px(120.)).child(
                                                         Label::new(author.clone())
-                                                            .size(LabelSize::XSmall)
+                                                            .size(LabelSize::Small)
                                                             .color(Color::Muted)
                                                             .single_line()
                                                             .truncate(),
@@ -926,6 +998,7 @@ impl GitPanel {
                                         &refs,
                                         head_branch.as_ref(),
                                         &remote_names,
+                                        filter,
                                         is_unpushed,
                                         badge_color,
                                         cx,
@@ -1010,6 +1083,7 @@ fn render_ref_badges(
     refs: &[SharedString],
     head_branch: Option<&SharedString>,
     remote_names: &[SharedString],
+    filter: ForkGitPanelLayoutSettings,
     is_unpushed: bool,
     color: Hsla,
     cx: &App,
@@ -1037,6 +1111,12 @@ fn render_ref_badges(
         }
     }
     branches.sort_by_key(|(_, is_head)| !is_head);
+    if !filter.show_tags {
+        tags.clear();
+    }
+    if !filter.show_remote_branches {
+        remotes.clear();
+    }
 
     // A remote branch next to its local branch only gets an icon.
     let (paired_remotes, lone_remotes): (Vec<_>, Vec<_>) =
@@ -1051,7 +1131,7 @@ fn render_ref_badges(
     let pill = |id: SharedString, icon: IconName, label: SharedString, emphasized: bool| {
         h_flex()
             .id(id)
-            .h(px(16.))
+            .h(px(18.))
             .max_w(px(140.))
             .min_w_0()
             .px_1()
@@ -1212,6 +1292,7 @@ mod tests {
                     settings.fork.get_or_insert_default().git_panel =
                         Some(ForkGitPanelSettingsContent {
                             layout: Some(layout),
+                            ..Default::default()
                         });
                 });
             });
