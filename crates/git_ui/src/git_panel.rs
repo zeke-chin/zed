@@ -1,6 +1,8 @@
 mod branch_mode;
 // FORK: VS Code style layout, see fork/HOOKS.md.
 mod fork_vscode_layout;
+use fork_vscode_layout::FORK_ENTRY_GROUP;
+pub(crate) use fork_vscode_layout::fork_group_by;
 
 use git_ui_core::askpass_modal::AskPassModal;
 pub(crate) use git_ui_core::notifications::{open_output, show_error_toast};
@@ -429,6 +431,8 @@ fn git_panel_view_options_menu(
         tree_view: GitPanelSettings::get_global(cx).tree_view,
     }));
 
+    // FORK: the VS Code layout always groups by staging state, see `fork_group_by`.
+    let fork_show_group_by_status = !GitPanel::fork_is_vscode_layout(cx);
     ContextMenu::build_persistent(window, cx, move |context_menu, _, _| {
         let state = view_options_menu_state.get();
 
@@ -512,19 +516,25 @@ fn git_panel_view_options_menu(
                                 }
                             })
                     })
-                    .item({
-                        let view_options_menu_state = view_options_menu_state.clone();
-                        ContextMenuEntry::new("Tracked & Untracked")
-                            .toggle(IconPosition::End, state.group_by == GitPanelGroupBy::Status)
-                            .handler(move |window, cx| {
-                                if state.group_by != GitPanelGroupBy::Status {
-                                    view_options_menu_state.set(GitPanelViewOptionsMenuState {
-                                        group_by: GitPanelGroupBy::Status,
-                                        ..state
-                                    });
-                                    window.dispatch_action(Box::new(SetGroupByStatus), cx);
-                                }
-                            })
+                    // FORK: hidden in the VS Code layout.
+                    .when(fork_show_group_by_status, |menu| {
+                        menu.item({
+                            let view_options_menu_state = view_options_menu_state.clone();
+                            ContextMenuEntry::new("Tracked & Untracked")
+                                .toggle(
+                                    IconPosition::End,
+                                    state.group_by == GitPanelGroupBy::Status,
+                                )
+                                .handler(move |window, cx| {
+                                    if state.group_by != GitPanelGroupBy::Status {
+                                        view_options_menu_state.set(GitPanelViewOptionsMenuState {
+                                            group_by: GitPanelGroupBy::Status,
+                                            ..state
+                                        });
+                                        window.dispatch_action(Box::new(SetGroupByStatus), cx);
+                                    }
+                                })
+                        })
                     })
                     .item({
                         let view_options_menu_state = view_options_menu_state.clone();
@@ -3530,6 +3540,8 @@ impl GitPanel {
                     this.update_visible_entries(window, cx);
                     this.show_error_toast("checkout", err, cx);
                 }
+                // FORK: re-read the status instead of waiting for file events, see `fork_rescan_repository`.
+                this.fork_rescan_repository(cx);
             })
             .ok();
         })
@@ -3696,6 +3708,8 @@ impl GitPanel {
                     if let Err(err) = result {
                         this.show_error_toast(if stage { "add" } else { "reset" }, err, cx);
                     }
+                    // FORK: re-read the status instead of waiting for file events, see `fork_rescan_repository`.
+                    this.fork_rescan_repository(cx);
                     this.update_counts(active_repository.read(cx));
                     cx.notify()
                 })
@@ -3919,6 +3933,8 @@ impl GitPanel {
                         this.show_error_toast(if stage { "add" } else { "reset" }, err, cx);
                         this.update_counts(active_repository.read(cx));
                     }
+                    // FORK: re-read the status instead of waiting for file events, see `fork_rescan_repository`.
+                    this.fork_rescan_repository(cx);
                     cx.notify();
                 })
             }
@@ -4393,6 +4409,8 @@ impl GitPanel {
                     }
                     Err(e) => this.show_error_toast("commit", e, cx),
                 }
+                // FORK: re-read the status instead of waiting for file events, see `fork_rescan_repository`.
+                this.fork_rescan_repository(cx);
             })
             .ok();
         });
@@ -8836,6 +8854,16 @@ impl GitPanel {
             .get(&section)
             .copied()
             .unwrap_or_default();
+        // FORK: VS Code style inline actions replace the count chip and checkbox.
+        let fork_actions = self.fork_render_header_actions(
+            section,
+            file_count,
+            section_is_empty,
+            has_write_access,
+            all_conflicts_resolved,
+            group_name.clone(),
+            cx,
+        );
 
         h_flex()
             .id(id)
@@ -8864,15 +8892,18 @@ impl GitPanel {
                         .color(Color::Muted),
                     )
                     .child(
-                        Label::new(header.title())
+                        // FORK: VS Code's group names in the VS Code layout.
+                        Label::new(Self::fork_section_title(section, cx).unwrap_or(header.title()))
                             .color(Color::Muted)
                             .size(LabelSize::Small),
                     ),
             )
-            .when(file_count > 0, |this| {
+            // FORK: VS Code style inline actions replace the count chip and checkbox.
+            .when(fork_actions.is_some(), |this| this.children(fork_actions))
+            .when(file_count > 0 && !Self::fork_is_vscode_layout(cx), |this| {
                 this.child(Chip::new(file_count.to_string()).label_color(Color::Muted))
             })
-            .child(if section_is_empty {
+            .child(if section_is_empty || Self::fork_is_vscode_layout(cx) {
                 gpui::Empty.into_any_element()
             } else {
                 let checkbox = Checkbox::new(checkbox_id, toggle_state)
@@ -9214,6 +9245,11 @@ impl GitPanel {
             None
         };
 
+        // FORK: VS Code style inline actions replace the diff stat and checkbox.
+        let fork_actions =
+            self.fork_render_status_actions(ix, entry, selected, has_write_access, repo, cx);
+        let show_checkbox = show_checkbox && fork_actions.is_none();
+
         let has_conflict = status.is_conflicted();
         let is_modified = status.is_modified();
         let is_deleted = status.is_deleted();
@@ -9324,9 +9360,11 @@ impl GitPanel {
                     this.child(icon)
                 }
             })
-            .when(status_style != StatusStyle::LabelColor, |el| {
-                el.child(git_status_icon(status))
-            })
+            // FORK: the VS Code layout shows a status letter at the end instead.
+            .when(
+                status_style != StatusStyle::LabelColor && fork_actions.is_none(),
+                |el| el.child(git_status_icon(status)),
+            )
             .map(|this| {
                 if tree_view {
                     this.pl(px(depth as f32 * TREE_INDENT)).child(
@@ -9351,6 +9389,8 @@ impl GitPanel {
 
         h_flex()
             .id(id)
+            // FORK: lets the inline actions show on hover.
+            .when(fork_actions.is_some(), |el| el.group(FORK_ENTRY_GROUP))
             .h(self.list_item_height())
             .w_full()
             .pl_2p5()
@@ -9371,16 +9411,21 @@ impl GitPanel {
                     .overflow_hidden()
                     .child(name_row),
             )
-            .when(GitPanelSettings::get_global(cx).diff_stats, |el| {
-                el.when_some(entry.diff_stat, move |this, stat| {
-                    let id = format!("diff-stat-{}", id_for_diff_stat);
-                    this.child(ui::DiffStat::new(
-                        id,
-                        stat.added as usize,
-                        stat.deleted as usize,
-                    ))
-                })
-            })
+            // FORK: the VS Code layout renders the diff stat with its actions.
+            .when(
+                GitPanelSettings::get_global(cx).diff_stats && fork_actions.is_none(),
+                |el| {
+                    el.when_some(entry.diff_stat, move |this, stat| {
+                        let id = format!("diff-stat-{}", id_for_diff_stat);
+                        this.child(ui::DiffStat::new(
+                            id,
+                            stat.added as usize,
+                            stat.deleted as usize,
+                        ))
+                    })
+                },
+            )
+            .children(fork_actions)
             .when(show_checkbox, |this| {
                 this.child(
                     div()
@@ -9562,6 +9607,17 @@ impl GitPanel {
             StageStatus::Unstaged => ToggleState::Unselected,
             StageStatus::PartiallyStaged => ToggleState::Indeterminate,
         });
+        // FORK: VS Code style inline actions replace the checkbox.
+        let fork_actions = self.fork_render_directory_actions(
+            ix,
+            entry,
+            selected,
+            stage_status,
+            has_write_access,
+            resolved_conflict,
+            cx,
+        );
+        let show_checkbox = show_checkbox && fork_actions.is_none();
 
         let name_row = h_flex()
             .min_w_0()
@@ -9610,6 +9666,10 @@ impl GitPanel {
             .hover(|s| s.bg(hover_bg))
             .active(|s| s.bg(active_bg))
             .child(name_row)
+            // FORK: VS Code style inline actions replace the checkbox.
+            .when(fork_actions.is_some(), |this| {
+                this.group(FORK_ENTRY_GROUP).children(fork_actions)
+            })
             .when(show_checkbox, |this| {
                 this.child(
                     div()

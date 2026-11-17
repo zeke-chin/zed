@@ -77,7 +77,8 @@ impl Settings for GitPanelSettings {
             },
             fallback_branch_name: git_panel.fallback_branch_name.unwrap(),
             sort_by: git_panel.sort_by.unwrap(),
-            group_by: git_panel.group_by.unwrap(),
+            // FORK: the VS Code layout groups by staging state like VS Code does.
+            group_by: crate::git_panel::fork_group_by(content, git_panel.group_by.unwrap()),
             collapse_untracked_diff: git_panel.collapse_untracked_diff.unwrap(),
             tree_view: git_panel.tree_view.unwrap(),
             diff_stats: git_panel.diff_stats.unwrap(),
