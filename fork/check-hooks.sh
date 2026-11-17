@@ -18,7 +18,7 @@ hooks_file="fork/HOOKS.md"
 
 is_fork_owned() {
     case "$1" in
-        fork/* | crates/fork_*/* | crates/settings_content/src/fork.rs | crates/git_ui/src/git_panel/fork_vscode_layout.rs) return 0 ;;
+        fork/* | crates/fork_*/* | crates/settings_content/src/fork.rs | crates/git_ui/src/git_panel/fork_vscode_layout.rs | crates/git_ui/src/git_panel/fork_vscode_layout/*) return 0 ;;
         # 新增 crate 带来的锁文件变化，变基冲突时重新生成即可，见 HOOKS.md。
         Cargo.lock) return 0 ;;
         *) return 1 ;;

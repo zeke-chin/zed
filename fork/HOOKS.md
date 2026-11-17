@@ -19,7 +19,7 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 
 | H9 | `crates/settings/src/vscode_import.rs` | `settings_content()` 的 `SettingsContent { … }` 末尾加 `fork: None` | 这里用结构体字面量列出了全部字段，加字段后不补这一行编译不过 |
 | H11 | `crates/git_ui/src/git_panel.rs` | `mod fork_vscode_layout;`；`GitPanel` 加字段 `fork_layout` 并在 `new` 里初始化；`set_active_tab` 开头先调 `fork_set_active_tab`，返回 `true` 即结束；`load_commit_history` 的订阅和 `set_active_repository` 里两处 `active_tab == GitPanelTab::History` 换成 `fork_history_is_shown(cx)`；`Render` 开头算出 `fork_body`，有值时不画标签栏，并在 `match self.active_tab` 前加一个分支直接放入 `fork_body` | Git 面板的 VS Code 式布局（设计文档 9）。标签页和历史加载逻辑都在 `GitPanel` 的私有方法里，只能用子模块访问，子模块必须在这个文件里声明 |
-| H12 | `crates/git_ui/src/git_panel/fork_vscode_layout.rs` | **新文件**，布局设置、状态、渲染和测试 | 作为 `git_panel` 的子模块才能用 `GitPanel` 的私有字段和方法；新文件不会冲突 |
+| H12 | `crates/git_ui/src/git_panel/fork_vscode_layout.rs` | **新文件**（另有子模块 `fork_vscode_layout/graph.rs`），布局设置、状态、渲染、历史连线和测试 | 作为 `git_panel` 的子模块才能用 `GitPanel` 的私有字段和方法；新文件不会冲突 |
 
 计划中的挂钩（还没落地）：
 
