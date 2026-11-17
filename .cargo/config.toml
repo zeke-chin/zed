@@ -1,7 +1,8 @@
 [target.'cfg(all())']
 # v0 mangling scheme provides more detailed backtraces around closures
 # zed_no_webrtc (fork): drop LiveKit/WebRTC (calls, screen sharing) and use the mock client instead
-rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable", "--cfg", "zed_no_webrtc"]
+# zed_no_bedrock (fork): drop the Amazon Bedrock language model provider and its AWS SDK dependencies
+rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable", "--cfg", "zed_no_webrtc", "--cfg", "zed_no_bedrock"]
 
 [alias]
 xtask = "run --package xtask --"
