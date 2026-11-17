@@ -20,6 +20,7 @@ pub struct ForkSettingsContent {
     pub copy_anchor: Option<CopyAnchorSettingsContent>,
     pub json_explorer: Option<JsonExplorerSettingsContent>,
     pub windsurf: Option<WindsurfSettingsContent>,
+    pub git_panel: Option<ForkGitPanelSettingsContent>,
 }
 
 #[derive(
@@ -113,4 +114,27 @@ pub enum WindsurfBackend {
     Native,
     /// Go through the official Windsurf language server binary.
     LanguageServer,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ForkGitPanelSettingsContent {
+    /// How the Git panel arranges the commit editor, the changes list and the
+    /// commit history.
+    ///
+    /// Default: tabs
+    pub layout: Option<ForkGitPanelLayout>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkGitPanelLayout {
+    /// Upstream layout: Changes and History tabs, commit editor at the bottom.
+    #[default]
+    Tabs,
+    /// VS Code style: commit editor at the top, changes in the middle and the
+    /// commit history below them, all visible at once.
+    Vscode,
 }
