@@ -429,6 +429,14 @@ impl GitBlame {
         })
     }
 
+    // FORK: H21. The entry starts at a different row after preceding buffer edits.
+    pub fn fork_row_offset_in_entry(&self, buffer_id: BufferId, row: u32) -> Option<u32> {
+        let mut cursor = self.buffers.get(&buffer_id)?.entries.cursor::<u32>(());
+        cursor.seek_forward(&row, Bias::Right);
+        cursor.item()?.blame.as_ref()?;
+        row.checked_sub(*cursor.start())
+    }
+
     pub fn max_author_length(&mut self, cx: &mut App) -> usize {
         let mut max_author_length = 0;
         self.sync_all(cx);
@@ -1325,6 +1333,67 @@ mod tests {
                 blame.tag_names_for_entry(buffer_two_id, &blame_entry("0d0d0d", 0..2)),
                 Vec::<SharedString>::new()
             );
+        });
+    }
+
+    // FORK: H21. Test fragment offsets separately from Git's original line numbers.
+    #[gpui::test]
+    async fn test_fork_row_offset_in_entry(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/my-repo"),
+            json!({
+                ".git": {}, "file.txt": "0\n1\n2\n3\n4\n5\n"
+            }),
+        )
+        .await;
+        let mut first = blame_entry("1b1b1b", 0..3);
+        first.original_line_number = 11;
+        let mut second = blame_entry("2c2c2c", 3..6);
+        second.original_line_number = 21;
+        fs.set_blame_for_repo(
+            Path::new(path!("/my-repo/.git")),
+            vec![(
+                repo_path("file.txt"),
+                Blame {
+                    entries: vec![first, second],
+                    ..Default::default()
+                },
+            )],
+        );
+        let project = Project::test(fs, [path!("/my-repo").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/my-repo/file.txt"), cx)
+            })
+            .await
+            .expect("fixture buffer opens");
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+        let blame = cx.new(|cx| GitBlame::new(multi_buffer.clone(), project, false, true, cx));
+        cx.run_until_parked();
+        blame.update(cx, |blame, cx| {
+            blame.sync(cx, buffer_id);
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 0), Some(0));
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 2), Some(2));
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 4), Some(1));
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 6), None);
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 100), None);
+        });
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(Point::new(1, 0)..Point::new(1, 0), "inserted\n")],
+                None,
+                cx,
+            );
+        });
+        blame.update(cx, |blame, cx| {
+            blame.sync(cx, buffer_id);
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 1), None);
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 2), Some(0));
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 3), Some(1));
+            assert_eq!(blame.fork_row_offset_in_entry(buffer_id, 5), Some(1));
         });
     }
 

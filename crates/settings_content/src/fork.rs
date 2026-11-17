@@ -22,6 +22,7 @@ pub struct ForkSettingsContent {
     pub windsurf: Option<WindsurfSettingsContent>,
     pub git_panel: Option<ForkGitPanelSettingsContent>,
     pub markdown_preview: Option<ForkMarkdownPreviewSettingsContent>,
+    pub blame_popover: Option<ForkBlamePopoverSettingsContent>,
 }
 
 #[with_fallible_options]
@@ -177,4 +178,23 @@ pub enum ForkGitPanelLayout {
     /// VS Code style: commit editor at the top, changes in the middle and the
     /// commit history below them, all visible at once.
     Vscode,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ForkBlamePopoverSettingsContent {
+    /// Which layout the inline blame hover uses.
+    ///
+    /// Default: zed
+    pub style: Option<ForkBlamePopoverStyle>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkBlamePopoverStyle {
+    #[default]
+    Zed,
+    Gitlens,
 }

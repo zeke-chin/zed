@@ -1,3 +1,6 @@
+// FORK: H23. The optional layout stays isolated from the upstream renderer.
+mod fork_gitlens_popover;
+
 use crate::{
     commit_tooltip::{
         CommitAvatar, CommitTooltip, blame_entry_timestamp, commit_tag_chips,
@@ -344,6 +347,22 @@ impl BlameRenderer for GitBlameRenderer {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
+        // FORK: H23. Default settings keep the upstream popover unchanged.
+        if fork_gitlens_popover::ForkBlamePopoverSettings::get_global(cx).style
+            == settings::ForkBlamePopoverStyle::Gitlens
+        {
+            return Some(fork_gitlens_popover::render(
+                blame,
+                scroll_handle,
+                details,
+                markdown,
+                repository,
+                workspace,
+                window,
+                cx,
+            ));
+        }
+
         let commit_time = blame
             .committer_time
             .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())

@@ -2254,12 +2254,22 @@ impl EditorElement {
             ..Default::default()
         };
 
-        let Some((buffer_id, blame_entry)) = blame
+        let Some((buffer_id, mut blame_entry)) = blame
             .update(cx, |blame, cx| blame.blame_for_rows(&[row_info], cx).next())
             .flatten()
         else {
             return;
         };
+
+        // FORK: H20. Git's original line is 1-based and describes the whole entry.
+        if let Some(offset) = blame
+            .read(cx)
+            .fork_row_offset_in_entry(buffer_id, buffer_point.row)
+        {
+            blame_entry.original_line_number =
+                blame_entry.original_line_number.saturating_add(offset);
+            blame_entry.range = buffer_point.row..buffer_point.row.saturating_add(1);
+        }
 
         let Some((popover_state, target_point)) = self.editor.read_with(cx, |editor, _| {
             editor

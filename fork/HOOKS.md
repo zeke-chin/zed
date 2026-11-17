@@ -28,6 +28,11 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H17 | `crates/workspace/src/multi_workspace.rs` | `MultiWorkspace` 加字段 `fork_new_groups_expanded`（`new` 里为 `false`），`ensure_project_group_state` 新建分组时用它代替 `expanded: true`；`test_new` 把它设为 `true`，另加测试用的 `fork_set_new_groups_expanded` | 侧边栏新项目分组默认折叠（设计文档 11）。`ensure_project_group_state` 是分组状态唯一的创建入口。上游测试都经 `test_new` 构造且大量断言默认展开，让 `test_new` 保持上游行为，上游测试就不用改 |
 | H18 | `crates/sidebar/src/sidebar.rs` | `render_project_header` 的 `on_click` 对调两个分支（单击切到项目，⌘-单击展开/折叠）；`confirm` 落在项目标题上改为切到项目；`…` 菜单「Focus Project」的快捷提示从「⌘-click」改成「click」，并删掉因此不再用的 `Modifiers`、`render_modifiers` 导入 | 把侧边栏当工作区切换器用（设计文档 11） |
 | H19 | `crates/sidebar/src/sidebar_tests.rs` | 末尾追加 fork 测试（含补回 `use gpui::Modifiers;`，H18 删了 `sidebar.rs` 里的导入，上游测试靠 `use super::*` 用到它）；上游 `test_keyboard_confirm_on_project_header_toggles_collapse` 按新行为改写 | 同上；Enter 的行为改了，上游这条测试只能跟着改 |
+| H20 | `crates/editor/src/element.rs` | `layout_blame_popover` 把 blame 条目的原始行号收窄到光标行 | diff 需要光标所在行，而不是整个条目的第一行；Git 的原始行号为 1-based |
+| H21 | `crates/editor/src/git/blame.rs` | 加 `fork_row_offset_in_entry` 和 fork 测试 | sum tree 中的条目片段位置会随缓冲区编辑移动，不能直接用 `BlameEntry::range.start` |
+| H22 | `crates/project/src/git_store.rs` | 在 `fork_rescan` 附近加 `fork_load_revision_texts` | 使用本地已有的批量 revision 读取、文本解码和 object read limiter；不扩展远程协议，拒绝二进制和超过 2 MB 的版本 |
+| H23 | `crates/git_ui/src/blame_ui.rs` | 声明 fork 子模块；popover 渲染入口按设置提前分发 | 默认仍走上游布局，fork 布局复用 crate 内部的头像、时间和 CommitView |
+| H24 | `crates/git_ui/src/blame_ui/fork_gitlens_popover.rs` | **新文件**，GitLens 布局、异步 diff、64 项 LRU 缓存和测试 | fork 自有逻辑不散落到上游；缓存包含父 SHA/旧路径并隔离被淘汰任务的异步结果 |
 
 计划中的挂钩（还没落地）：
 
@@ -58,4 +63,9 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H17 | 接受上游版本，重新加字段并在 `new`、`test_new`、`ensure_project_group_state` 里补回。上游新增了别的分组创建入口时，也要让它读 `fork_new_groups_expanded` |
 | H18 | 接受上游版本，重新对调 `on_click` 的两个分支、改回 `confirm` 的标题分支和菜单提示。上游改了这几处的结构时按设计文档 11 的行为重做 |
 | H19 | 接受上游版本，重新追加文件末尾的 fork 测试段；被改写的那条上游测试再按新行为改一次 |
+| H20 | 接受上游版本，在 `layout_blame_popover` 取到条目后重新收窄行号；不要把 Git 的 1-based 原始行号提前转成 0-based，转换在 diff 选择函数中完成 |
+| H21 | 接受上游版本，重新加偏移查询和 fork 测试；sum tree 游标接口变动时按编译错误调整 |
+| H22 | 接受上游版本，重新加本地批量读取函数；保留 object read limiter、文本解码和大小限制；远程仍直接报不支持 |
+| H23 | 接受上游版本，重新加模块声明和按设置分发；renderer 参数变化时同步 H24 的入口 |
+| H24 | fork 自有文件，不会冲突；按编译错误跟进头像、Markdown、CommitView、滚动条等 crate 内部接口变化 |
 | `README.md` | 接受上游版本，重新把 `> [!IMPORTANT]` 两行加回文件开头。这两行由人工删除，冲突时不要跟着上游丢掉 |
