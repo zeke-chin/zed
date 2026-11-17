@@ -18,6 +18,8 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H8 | `crates/zed/src/zed.rs` | `load_default_keymap` 末尾调用 `fork_ext::load_default_keymap(cx)` | `reload_keymaps` 每次先 `clear_key_bindings()`，只在 init 时绑定一次的键位会在用户改 keymap 后丢失；放在这里，fork 键位排在官方默认之后、用户键位之前 |
 
 | H9 | `crates/settings/src/vscode_import.rs` | `settings_content()` 的 `SettingsContent { … }` 末尾加 `fork: None` | 这里用结构体字面量列出了全部字段，加字段后不补这一行编译不过 |
+| H11 | `crates/git_ui/src/git_panel.rs` | `mod fork_vscode_layout;`；`GitPanel` 加字段 `fork_layout` 并在 `new` 里初始化；`set_active_tab` 开头先调 `fork_set_active_tab`，返回 `true` 即结束；`load_commit_history` 的订阅和 `set_active_repository` 里两处 `active_tab == GitPanelTab::History` 换成 `fork_history_is_shown(cx)`；`Render` 开头算出 `fork_body`，有值时不画标签栏，并在 `match self.active_tab` 前加一个分支直接放入 `fork_body` | Git 面板的 VS Code 式布局（设计文档 9）。标签页和历史加载逻辑都在 `GitPanel` 的私有方法里，只能用子模块访问，子模块必须在这个文件里声明 |
+| H12 | `crates/git_ui/src/git_panel/fork_vscode_layout.rs` | **新文件**，布局设置、状态、渲染和测试 | 作为 `git_panel` 的子模块才能用 `GitPanel` 的私有字段和方法；新文件不会冲突 |
 
 计划中的挂钩（还没落地）：
 
@@ -39,3 +41,5 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H8 | 接受上游版本，在 `load_default_keymap` 末尾重新加一行；如果上游改了默认键位的加载流程，保证 fork 键位仍在每次重新加载时、用户键位之前绑定 |
 | H9 | 接受上游版本，在 `SettingsContent { … }` 字面量末尾重新加 `fork: None`。上游给 `SettingsContent` 加字段时这里最容易冲突，编译器会报 `missing field` |
 | H10 | 接受上游版本（上游 tag 之间这个文件一般不变），重新改成 `dev` |
+| H11 | 接受上游版本，重新加上各处 `// FORK:` 标注的行。上游新增了判断 `active_tab == GitPanelTab::History` 来决定是否加载或刷新历史的地方，也要换成 `fork_history_is_shown(cx)`；`Render` 的结构变了时，保证 VS Code 布局下不画标签栏和原来的正文 |
+| H12 | 新文件，不会冲突；按编译错误跟进 `GitPanel` 私有方法的改名或签名变化 |

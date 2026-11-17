@@ -1,4 +1,6 @@
 mod branch_mode;
+// FORK: VS Code style layout, see fork/HOOKS.md.
+mod fork_vscode_layout;
 
 use git_ui_core::askpass_modal::AskPassModal;
 pub(crate) use git_ui_core::notifications::{open_output, show_error_toast};
@@ -1363,6 +1365,8 @@ pub struct GitPanel {
     focused_history_entry: Option<usize>,
     active_history_sha: Option<Oid>,
     history_keyboard_nav: bool,
+    // FORK: VS Code style layout state.
+    fork_layout: fork_vscode_layout::LayoutState,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
     _settings_subscription: Subscription,
@@ -1737,6 +1741,8 @@ impl GitPanel {
                 focused_history_entry: None,
                 active_history_sha: None,
                 history_keyboard_nav: false,
+                // FORK: VS Code style layout state.
+                fork_layout: fork_vscode_layout::LayoutState::new(window, cx),
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
@@ -5824,7 +5830,8 @@ impl GitPanel {
             }
             self.git_access = None;
             self._repo_subscriptions.clear();
-            if self.active_tab == GitPanelTab::History {
+            // FORK: the history can be visible without its tab.
+            if self.fork_history_is_shown(cx) {
                 self.set_commit_history(CommitHistory::Loading, cx);
             }
         }
@@ -5835,7 +5842,8 @@ impl GitPanel {
         }
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
-        if self.active_tab == GitPanelTab::History {
+        // FORK: the history can be visible without its tab.
+        if self.fork_history_is_shown(cx) {
             self.load_commit_history(cx);
         }
         self.schedule_visible_entries_update(window, cx);
@@ -7976,6 +7984,10 @@ impl GitPanel {
     }
 
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
+        // FORK: in the VS Code layout both lists stay visible.
+        if self.fork_set_active_tab(tab, window, cx) {
+            return;
+        }
         if self.active_tab == tab {
             return;
         }
@@ -8028,7 +8040,8 @@ impl GitPanel {
                         event,
                         RepositoryEvent::GraphEvent(_, _) | RepositoryEvent::TagsChanged
                     ) {
-                        if this.active_tab == GitPanelTab::History {
+                        // FORK: the history can be visible without its tab.
+                        if this.fork_history_is_shown(cx) {
                             this.fetch_commit_history_entries(cx);
                         }
                     }
@@ -9955,6 +9968,9 @@ impl GitPanel {
 
 impl Render for GitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // FORK: VS Code style layout replaces the tabbed body.
+        let fork_body =
+            Self::fork_is_vscode_layout(cx).then(|| self.fork_render_vscode_body(window, cx));
         let project = self.project.read(cx);
         let has_entries = !self.entries.is_empty();
         let has_write_access = self.has_write_access(cx);
@@ -10054,10 +10070,14 @@ impl Render for GitPanel {
             .child(
                 v_flex()
                     .size_full()
-                    .when(!self.commit_editor_expanded, |this| {
-                        this.child(self.render_tab_bar(cx))
-                    })
+                    // FORK: the VS Code layout has no tab bar.
+                    .when(
+                        !self.commit_editor_expanded && fork_body.is_none(),
+                        |this| this.child(self.render_tab_bar(cx)),
+                    )
                     .map(|this| match self.active_tab {
+                        // FORK: VS Code style layout replaces the tabbed body.
+                        _ if fork_body.is_some() => this.children(fork_body),
                         GitPanelTab::Changes => this
                             .children(self.render_changes_header(window, cx))
                             .when(!self.commit_editor_expanded, |this| {
