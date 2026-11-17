@@ -321,4 +321,20 @@ mod tests {
         assert_eq!(rows[3].lane, 0);
         assert_ne!(rows[0].outgoing[0].color, rows[0].outgoing[1].color);
     }
+
+    #[test]
+    fn test_rows_of_a_prefix_match_the_full_history() {
+        let history = [
+            commit(6, &[5, 4]),
+            commit(4, &[2]),
+            commit(5, &[3, 2]),
+            commit(3, &[1]),
+            commit(2, &[1]),
+            commit(1, &[]),
+        ];
+        let full = compute_rows(&history, 4);
+        for len in 0..=history.len() {
+            assert_eq!(compute_rows(&history[..len], 4), full[..len]);
+        }
+    }
 }

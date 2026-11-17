@@ -12,7 +12,7 @@
 mod graph;
 
 use super::*;
-use gpui::{DragMoveEvent, FontWeight, Hsla, MouseUpEvent};
+use gpui::{DragMoveEvent, EntityId, FontWeight, Hsla, MouseUpEvent};
 use settings::{
     ForkGitPanelLayout, ForkGitPanelSettingsContent, RegisterSetting, Settings, SettingsContent,
     SettingsStore,
@@ -28,6 +28,7 @@ const COMMIT_EDITOR_MAX_LINES: usize = 10;
 /// Wider graphs are clipped so the commit subjects stay readable.
 const MAX_GRAPH_LANES: usize = 6;
 const MAX_REF_BADGES: usize = 2;
+const DEFAULT_GRAPH_PAGE_SIZE: usize = 50;
 /// Hover group of a changes list row, so its inline actions show on hover.
 pub(super) const FORK_ENTRY_GROUP: &str = "fork-git-entry";
 
@@ -57,6 +58,8 @@ pub struct ForkGitPanelLayoutSettings {
     pub layout: ForkGitPanelLayout,
     pub show_tags: bool,
     pub show_remote_branches: bool,
+    pub graph_page_size: usize,
+    pub graph_page_on_scroll: bool,
 }
 
 impl Settings for ForkGitPanelLayoutSettings {
@@ -75,6 +78,13 @@ impl Settings for ForkGitPanelLayoutSettings {
             show_remote_branches: git_panel
                 .and_then(|git_panel| git_panel.show_remote_branches)
                 .unwrap_or(true),
+            graph_page_size: git_panel
+                .and_then(|git_panel| git_panel.graph_page_size)
+                .unwrap_or(DEFAULT_GRAPH_PAGE_SIZE)
+                .max(1),
+            graph_page_on_scroll: git_panel
+                .and_then(|git_panel| git_panel.graph_page_on_scroll)
+                .unwrap_or(false),
         }
     }
 }
@@ -85,6 +95,14 @@ pub(super) struct LayoutState {
     /// `None` until the user drags the divider.
     history_height: Option<Pixels>,
     graph: Option<GraphCache>,
+    /// How many commits of the history are shown; grows by a page on "Show
+    /// More".
+    history_limit: usize,
+    /// Whether `git log` returned more commits than `history_limit`.
+    history_has_more: bool,
+    /// The repository and log source `history_limit` was counted for, so
+    /// switching either starts again from the first page.
+    history_source: Option<(EntityId, LogSource)>,
     _settings_subscription: Subscription,
     _window_activation_subscription: Subscription,
     /// Set on the first render: the panel's focus handle doesn't exist yet
@@ -103,13 +121,23 @@ struct GraphCache {
 
 impl LayoutState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<GitPanel>) -> Self {
-        let mut was_layout = ForkGitPanelLayoutSettings::get_global(cx).layout;
+        let settings = *ForkGitPanelLayoutSettings::get_global(cx);
+        let mut was_layout = settings.layout;
+        let mut was_page_size = settings.graph_page_size;
         let settings_subscription =
             cx.observe_global_in::<SettingsStore>(window, move |panel, window, cx| {
-                let layout = ForkGitPanelLayoutSettings::get_global(cx).layout;
+                let settings = *ForkGitPanelLayoutSettings::get_global(cx);
+                let (layout, page_size) = (settings.layout, settings.graph_page_size);
                 if layout != was_layout {
                     was_layout = layout;
                     panel.fork_layout_changed(window, cx);
+                }
+                if page_size != was_page_size {
+                    was_page_size = page_size;
+                    panel.fork_layout.history_source = None;
+                    if panel.fork_history_is_shown(cx) {
+                        panel.fetch_commit_history_entries(cx);
+                    }
                 }
             });
         // VS Code refreshes the status when its window comes back into focus,
@@ -125,6 +153,9 @@ impl LayoutState {
             history_collapsed: false,
             history_height: None,
             graph: None,
+            history_limit: settings.graph_page_size,
+            history_has_more: false,
+            history_source: None,
             _settings_subscription: settings_subscription,
             _window_activation_subscription: window_activation_subscription,
             focus_in_subscription: None,
@@ -201,8 +232,55 @@ impl GitPanel {
     }
 
     fn fork_unload_commit_history(&mut self, cx: &mut Context<Self>) {
+        self.fork_layout.history_source = None;
         self.set_commit_history(CommitHistory::Loading, cx);
         self._repo_subscriptions.clear();
+    }
+
+    /// Hook in `fetch_commit_history_entries`: the VS Code layout only keeps
+    /// the first `history_limit` commits, so the keyboard navigation and the
+    /// context menu upstream only ever see the commits on screen.
+    pub(super) fn fork_limit_history(
+        &mut self,
+        entries: Rc<[CommitHistoryEntry]>,
+        cx: &mut Context<Self>,
+    ) -> Rc<[CommitHistoryEntry]> {
+        if !Self::fork_is_vscode_layout(cx) {
+            return entries;
+        }
+        let source = self.active_repository.as_ref().and_then(|repository| {
+            Some((
+                repository.entity_id(),
+                Self::commit_history_log_source(repository, cx)?,
+            ))
+        });
+        if self.fork_layout.history_source != source {
+            self.fork_layout.history_source = source;
+            self.fork_layout.history_limit =
+                ForkGitPanelLayoutSettings::get_global(cx).graph_page_size;
+        }
+        let limit = self.fork_layout.history_limit;
+        let has_more = entries.len() > limit;
+        if self.fork_layout.history_has_more != has_more {
+            self.fork_layout.history_has_more = has_more;
+            cx.notify();
+        }
+        match entries.get(..limit) {
+            Some(shown) if has_more => Rc::from(shown),
+            _ => entries,
+        }
+    }
+
+    /// Shows the next page of the history. Only acts when the limit is still
+    /// `shown_limit`, so a request made twice for the same page (the
+    /// auto-loading row can be laid out more than once) adds one page.
+    fn fork_show_more_history(&mut self, shown_limit: usize, cx: &mut Context<Self>) {
+        if self.fork_layout.history_limit != shown_limit || !self.fork_layout.history_has_more {
+            return;
+        }
+        self.fork_layout.history_limit +=
+            ForkGitPanelLayoutSettings::get_global(cx).graph_page_size;
+        self.fetch_commit_history_entries(cx);
     }
 
     fn fork_set_history_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
@@ -334,11 +412,12 @@ impl GitPanel {
                 let response =
                     repository.graph_data(log_source, LogOrder::DateOrder, 0..usize::MAX, cx);
                 let commits = response.commits;
-                let matches = commits.len() == entries.len()
-                    && commits
-                        .iter()
-                        .zip(entries.iter())
-                        .all(|(c, e)| c.sha == e.sha);
+                // The VS Code layout only shows the first page of the log.
+                let commits = commits.get(..entries.len())?;
+                let matches = commits
+                    .iter()
+                    .zip(entries.iter())
+                    .all(|(c, e)| c.sha == e.sha);
                 matches.then(|| {
                     let rows = graph::compute_rows(commits, color_count);
                     let max_lanes = rows.iter().map(|row| row.width).max().unwrap_or(1);
@@ -924,6 +1003,9 @@ impl GitPanel {
             .context_menu
             .as_ref()
             .and_then(|context_menu| context_menu.target_entry_index);
+        let has_more = self.fork_layout.history_has_more;
+        let shown_limit = self.fork_layout.history_limit;
+        let commit_count = entries.len();
 
         v_flex()
             .flex_1()
@@ -932,8 +1014,18 @@ impl GitPanel {
             .child(
                 uniform_list(
                     "fork-commit-history",
-                    entries.len(),
+                    commit_count + usize::from(has_more),
                     move |range, _window, cx| {
+                        let show_more_row =
+                            (has_more && range.contains(&commit_count)).then(|| {
+                                render_show_more_row(
+                                    git_panel.clone(),
+                                    shown_limit,
+                                    graph_lanes,
+                                    cx,
+                                )
+                            });
+                        let range = range.start.min(commit_count)..range.end.min(commit_count);
                         let date_style = GitPanelSettings::get_global(cx).date_style;
                         let theme = cx.theme().clone();
                         let colors = theme.colors();
@@ -1127,6 +1219,7 @@ impl GitPanel {
                                     })
                                     .into_any_element()
                             })
+                            .chain(show_more_row)
                             .collect()
                     },
                 )
@@ -1555,6 +1648,56 @@ fn fork_status_letter(status: FileStatus) -> impl IntoElement {
 /// Branch, remote and tag badges at the end of a history row, like VS Code's
 /// graph: the checked-out branch first, a remote that points at the same
 /// commit as a local branch collapses into a small cloud icon.
+/// Last row of the history while `git log` has more commits than are shown.
+fn render_show_more_row(
+    git_panel: WeakEntity<GitPanel>,
+    shown_limit: usize,
+    graph_lanes: usize,
+    cx: &mut App,
+) -> AnyElement {
+    let row = h_flex()
+        .id("fork-history-show-more-row")
+        .h(HISTORY_ROW_HEIGHT)
+        .w_full()
+        .child(div().flex_none().w(graph::graph_width(graph_lanes)));
+    if ForkGitPanelLayoutSettings::get_global(cx).graph_page_on_scroll {
+        // The row is only laid out once it is scrolled into view. Updating the
+        // panel has to wait until the list is done rendering.
+        cx.defer(move |cx| {
+            git_panel
+                .update(cx, |panel, cx| {
+                    panel.fork_show_more_history(shown_limit, cx)
+                })
+                .ok();
+        });
+        return row
+            .child(
+                Label::new("Loading More…")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .into_any_element();
+    }
+    row.child(
+        Button::new("fork-history-show-more", "Show More")
+            .label_size(LabelSize::Small)
+            .color(Color::Muted)
+            .start_icon(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(move |_, _, cx| {
+                git_panel
+                    .update(cx, |panel, cx| {
+                        panel.fork_show_more_history(shown_limit, cx)
+                    })
+                    .ok();
+            }),
+    )
+    .into_any_element()
+}
+
 fn render_ref_badges(
     refs: &[SharedString],
     head_branch: Option<&SharedString>,
@@ -1743,7 +1886,6 @@ mod tests {
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
     use project::FakeFs;
     use serde_json::json;
-    use settings::ForkGitPanelSettingsContent;
     use std::path::Path;
     use theme::LoadThemes;
     use util::path;
@@ -1765,11 +1907,28 @@ mod tests {
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.fork.get_or_insert_default().git_panel =
-                        Some(ForkGitPanelSettingsContent {
-                            layout: Some(layout),
-                            ..Default::default()
-                        });
+                    settings
+                        .fork
+                        .get_or_insert_default()
+                        .git_panel
+                        .get_or_insert_default()
+                        .layout = Some(layout);
+                });
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    fn set_page_size(page_size: usize, cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .fork
+                        .get_or_insert_default()
+                        .git_panel
+                        .get_or_insert_default()
+                        .graph_page_size = Some(page_size);
                 });
             });
         });
@@ -1779,19 +1938,34 @@ mod tests {
     async fn panel_with_one_commit(
         cx: &mut TestAppContext,
     ) -> (Entity<Workspace>, Entity<GitPanel>, VisualTestContext) {
+        panel_with_linear_history(1, None, cx).await
+    }
+
+    /// A branchless history of `count` commits, each the parent of the one
+    /// before it.
+    async fn panel_with_linear_history(
+        count: u8,
+        page_size: Option<usize>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, Entity<GitPanel>, VisualTestContext) {
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
             .await;
         let dot_git = Path::new(path!("/root/project/.git"));
-        let sha: Oid = "0123456789012345678901234567890123456789".parse().unwrap();
+        let sha = |n: u8| -> Oid { format!("{n:040x}").parse().unwrap() };
         fs.with_git_state(dot_git, false, |state| {
             state.current_branch_name = None;
-            state.refs.insert("HEAD".into(), sha.to_string());
-            state.graph_commits = vec![Arc::new(git::repository::InitialGraphCommitData {
-                sha,
-                parents: SmallVec::new(),
-                ref_names: Vec::new(),
-            })];
+            state.refs.insert("HEAD".into(), sha(count).to_string());
+            state.graph_commits = (1..=count)
+                .rev()
+                .map(|n| {
+                    Arc::new(git::repository::InitialGraphCommitData {
+                        sha: sha(n),
+                        parents: (n > 1).then(|| sha(n - 1)).into_iter().collect(),
+                        ref_names: Vec::new(),
+                    })
+                })
+                .collect();
         })
         .unwrap();
 
@@ -1817,6 +1991,9 @@ mod tests {
         cx.run_until_parked();
 
         set_layout(ForkGitPanelLayout::Vscode, &mut cx);
+        if let Some(page_size) = page_size {
+            set_page_size(page_size, &mut cx);
+        }
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         cx.run_until_parked();
         (workspace, panel, cx)
@@ -1995,5 +2172,89 @@ mod tests {
         let grown_changes = cx.debug_bounds("fork-git-changes-section").unwrap();
         assert!(collapsed_history.size.height < history.size.height);
         assert!(grown_changes.size.height > changes.size.height);
+    }
+
+    #[gpui::test]
+    async fn test_history_is_shown_a_page_at_a_time(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, panel, mut cx) = panel_with_linear_history(5, Some(2), cx).await;
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(history_len(panel), Some(2));
+            assert!(panel.fork_layout.history_has_more);
+        });
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.fork_show_more_history(2, cx);
+            // A second request for the same page is ignored.
+            panel.fork_show_more_history(2, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(history_len(panel), Some(4));
+            assert!(panel.fork_layout.history_has_more);
+        });
+
+        panel.update(&mut cx, |panel, cx| panel.fork_show_more_history(4, cx));
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(history_len(panel), Some(5));
+            assert!(!panel.fork_layout.history_has_more);
+        });
+
+        // Collapsing the section starts again from the first page.
+        panel.update(&mut cx, |panel, cx| {
+            panel.fork_set_history_collapsed(true, cx);
+            panel.fork_set_history_collapsed(false, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| assert_eq!(history_len(panel), Some(2)));
+
+        // So does changing the page size.
+        panel.update(&mut cx, |panel, cx| panel.fork_show_more_history(2, cx));
+        cx.run_until_parked();
+        set_page_size(3, &mut cx);
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(history_len(panel), Some(3));
+            assert!(panel.fork_layout.history_has_more);
+        });
+
+        // The tabs layout keeps upstream's full history.
+        set_layout(ForkGitPanelLayout::Tabs, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.set_active_tab(GitPanelTab::History, window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| assert_eq!(history_len(panel), Some(5)));
+    }
+
+    #[gpui::test]
+    async fn test_history_without_more_commits_has_no_show_more(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, panel, cx) = panel_with_linear_history(2, Some(2), cx).await;
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(history_len(panel), Some(2));
+            assert!(!panel.fork_layout.history_has_more);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_graph_covers_only_the_shown_commits(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, panel, mut cx) = panel_with_linear_history(5, Some(2), cx).await;
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                panel
+                    .fork_layout
+                    .graph
+                    .as_ref()
+                    .map(|graph| graph.rows.len()),
+                Some(2)
+            );
+        });
     }
 }
