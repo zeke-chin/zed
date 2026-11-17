@@ -8095,6 +8095,8 @@ impl GitPanel {
                 .collect();
             (entries, response.is_loading, response.error)
         });
+        // FORK: the VS Code layout shows the history a page at a time.
+        let entries = self.fork_limit_history(entries, cx);
 
         self.set_commit_history(commit_history_from_response(entries, is_loading, error), cx);
     }

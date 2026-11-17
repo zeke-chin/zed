@@ -154,6 +154,16 @@ pub struct ForkGitPanelSettingsContent {
     ///
     /// Default: true
     pub show_remote_branches: Option<bool>,
+    /// How many commits the history in the VS Code layout shows at first, and
+    /// how many more each "Show More" adds.
+    ///
+    /// Default: 50
+    pub graph_page_size: Option<usize>,
+    /// Whether the history in the VS Code layout loads the next page when it
+    /// is scrolled to the end, instead of showing a "Show More" button.
+    ///
+    /// Default: false
+    pub graph_page_on_scroll: Option<bool>,
 }
 
 #[derive(
