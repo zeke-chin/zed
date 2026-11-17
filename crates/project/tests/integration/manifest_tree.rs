@@ -121,4 +121,138 @@ mod path_trie {
         });
         assert_eq!(visited_paths.len(), 2);
     }
+
+    // FORK: Cover stale negative caches when an ancestor manifest is discovered (H25).
+    #[test]
+    fn discovering_ancestor_root_clears_only_matching_absent_descendants() {
+        let mut trie = RootPathTrie::<&str>::new();
+        trie.insert(
+            &TriePath::new(rel_path("project/src/main.rs")),
+            "cargo",
+            LabelPresence::KnownAbsent,
+        );
+        trie.insert(
+            &TriePath::new(rel_path("project/src/main.rs")),
+            "python",
+            LabelPresence::KnownAbsent,
+        );
+        trie.insert(
+            &TriePath::new(rel_path("project/nested")),
+            "cargo",
+            LabelPresence::Present,
+        );
+        trie.insert(
+            &TriePath::new(rel_path("project/nested/src/lib.rs")),
+            "cargo",
+            LabelPresence::KnownAbsent,
+        );
+        trie.insert(
+            &TriePath::new(rel_path("other/main.rs")),
+            "cargo",
+            LabelPresence::KnownAbsent,
+        );
+        trie.insert(
+            &TriePath::new(rel_path("project")),
+            "cargo",
+            LabelPresence::Present,
+        );
+
+        let mut visited = Vec::new();
+        trie.walk(
+            &TriePath::new(rel_path("project/src/main.rs")),
+            &mut |path, labels| {
+                visited.push((path.clone(), labels.clone()));
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(
+            visited,
+            vec![
+                (
+                    rel_path("project").into(),
+                    [("cargo", LabelPresence::Present)].into()
+                ),
+                (
+                    rel_path("project/src/main.rs").into(),
+                    [("python", LabelPresence::KnownAbsent)].into()
+                ),
+            ]
+        );
+
+        let mut visited = Vec::new();
+        trie.walk(
+            &TriePath::new(rel_path("project/nested/src/lib.rs")),
+            &mut |path, labels| {
+                visited.push((path.clone(), labels.clone()));
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(
+            visited,
+            vec![
+                (
+                    rel_path("project").into(),
+                    [("cargo", LabelPresence::Present)].into()
+                ),
+                (
+                    rel_path("project/nested").into(),
+                    [("cargo", LabelPresence::Present)].into()
+                ),
+            ]
+        );
+        trie.walk(
+            &TriePath::new(rel_path("other/main.rs")),
+            &mut |_, labels| {
+                assert_eq!(labels.get("cargo"), Some(&LabelPresence::KnownAbsent));
+                ControlFlow::Continue(())
+            },
+        );
+    }
+
+    #[test]
+    fn discovering_root_promotes_an_absent_node() {
+        let mut trie = RootPathTrie::<()>::new();
+        let path = TriePath::new(rel_path("project"));
+        trie.insert(&path, (), LabelPresence::KnownAbsent);
+        trie.insert(&path, (), LabelPresence::Present);
+        let mut visited = Vec::new();
+        trie.walk(&path, &mut |path, labels| {
+            visited.push((path.clone(), labels.clone()));
+            ControlFlow::Continue(())
+        });
+        assert_eq!(
+            visited,
+            vec![(
+                rel_path("project").into(),
+                [((), LabelPresence::Present)].into()
+            )]
+        );
+    }
+
+    #[test]
+    fn discovering_worktree_root_clears_absent_descendants() {
+        let mut trie = RootPathTrie::<()>::new();
+        trie.insert(
+            &TriePath::new(rel_path("src/main.rs")),
+            (),
+            LabelPresence::KnownAbsent,
+        );
+        trie.insert(
+            &TriePath::new(rel_path("tests/test.rs")),
+            (),
+            LabelPresence::KnownAbsent,
+        );
+        trie.insert(&TriePath::new(rel_path("")), (), LabelPresence::Present);
+        for path in ["src/main.rs", "tests/test.rs"] {
+            let mut visited = Vec::new();
+            trie.walk(&TriePath::new(rel_path(path)), &mut |path, labels| {
+                visited.push((path.clone(), labels.clone()));
+                ControlFlow::Continue(())
+            });
+            assert_eq!(
+                visited,
+                vec![(rel_path("").into(), [((), LabelPresence::Present)].into())]
+            );
+        }
+    }
 }
