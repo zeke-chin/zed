@@ -6619,6 +6619,8 @@ dependencies = [
  "language",
  "menu",
  "project",
+ "project_panel",
+ "remote_connection",
  "search",
  "serde_json",
  "settings",
@@ -6627,6 +6629,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "zed_actions",
 ]
 
 [[package]]

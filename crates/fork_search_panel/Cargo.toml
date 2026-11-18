@@ -28,6 +28,7 @@ theme_settings.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
+zed_actions.workspace = true
 
 [dev-dependencies]
 db = { workspace = true, features = ["test-support"] }
@@ -35,6 +36,8 @@ editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 language = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
+project_panel.workspace = true
+remote_connection = { workspace = true, features = ["test-support"] }
 search = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
 theme.workspace = true

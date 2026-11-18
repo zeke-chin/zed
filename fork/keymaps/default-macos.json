@@ -40,6 +40,7 @@
     "bindings": {
       "enter": "menu::Confirm",
       "cmd-enter": "fork_search_panel::OpenSelected",
+      "cmd-shift-h": "fork_search_panel::ToggleReplace",
       "up": "menu::SelectPrevious",
       "down": "menu::SelectNext",
       "left": "fork_search_panel::Collapse",
@@ -48,11 +49,19 @@
     }
   },
   {
-    "context": "Editor && fork_search_input",
+    "context": "fork_search_input > Editor",
     "bindings": {
       "enter": "fork_search_panel::Search",
       "down": "fork_search_panel::FocusResults",
       "cmd-enter": "fork_search_panel::OpenInEditor"
+    }
+  },
+  {
+    "context": "fork_replace_input > Editor",
+    "bindings": {
+      "enter": "fork_search_panel::ReplaceSelected",
+      "cmd-enter": "fork_search_panel::ReplaceAll",
+      "down": "fork_search_panel::FocusResults"
     }
   }
 ]

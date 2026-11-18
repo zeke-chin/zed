@@ -3,11 +3,11 @@ use editor::{Editor, EditorElement, EditorStyle, actions::SelectAll};
 use file_icons::FileIcons;
 use futures::{StreamExt, pin_mut};
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ScrollStrategy, Subscription, Task, TextStyle, UniformListScrollHandle, WeakEntity, Window,
-    actions, div, relative, rems, uniform_list,
+    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
+    IntoElement, ScrollStrategy, StyledText, Subscription, Task, TextStyle,
+    UniformListScrollHandle, WeakEntity, Window, actions, div, relative, rems, uniform_list,
 };
-use language::{Anchor, Buffer, Point};
+use language::{Anchor, Buffer, BufferSnapshot, Point};
 use menu::{Cancel, Confirm, SelectNext, SelectPrevious};
 use project::{
     Project,
@@ -17,7 +17,7 @@ use search::{SearchOption, SearchOptions, ToggleCaseSensitive, ToggleRegex, Togg
 use settings::{ForkSearchPanelDock, RegisterSetting, Settings, SettingsContent, SettingsStore};
 use std::{ops::Range, path::Path, time::Duration};
 use theme_settings::ThemeSettings;
-use ui::{CommonAnimationExt, HighlightedLabel, IconButtonShape, Tooltip, prelude::*};
+use ui::{CommonAnimationExt, IconButtonShape, LabelLike, Tooltip, prelude::*};
 use util::{ResultExt, paths::PathMatcher};
 use workspace::{
     DeploySearch, Workspace,
@@ -35,6 +35,14 @@ actions!(
         OpenInEditor,
         /// Shows or hides the file filters.
         ToggleFilters,
+        /// Shows or hides the replacement input.
+        ToggleReplace,
+        /// Toggles preserving the case of replaced text.
+        TogglePreserveCase,
+        /// Replaces the selected search match.
+        ReplaceSelected,
+        /// Replaces all search matches after confirmation.
+        ReplaceAll,
         /// Runs the current search immediately.
         Search,
         /// Clears the current search and its results.
@@ -92,6 +100,7 @@ enum SearchState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum InputPanel {
     Query,
+    Replacement,
     Include,
     Exclude,
 }
@@ -112,6 +121,7 @@ struct PanelMatch {
     line_number: u32,
     preview: SharedString,
     highlight_ranges: Vec<Range<usize>>,
+    matched_text: SharedString,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,12 +142,41 @@ impl ResultRow {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReplacementScope {
+    Match {
+        file_index: usize,
+        match_index: usize,
+    },
+    File(usize),
+    All,
+}
+
+struct ReplacementTarget {
+    buffer: Entity<Buffer>,
+    snapshot: BufferSnapshot,
+    path: SharedString,
+    matches: Vec<PanelMatch>,
+}
+
+struct ReplacementPlan {
+    buffer: Entity<Buffer>,
+    snapshot: BufferSnapshot,
+    path: SharedString,
+    edits: Vec<(Range<usize>, String)>,
+}
+
 pub struct SearchPanel {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
     results_focus_handle: FocusHandle,
     query_editor: Entity<Editor>,
+    replacement_editor: Entity<Editor>,
+    replace_visible: bool,
+    preserve_case: bool,
+    active_query: Option<SearchQuery>,
+    replacement_task: Option<Task<()>>,
     included_files_editor: Entity<Editor>,
     excluded_files_editor: Entity<Editor>,
     search_options: SearchOptions,
@@ -189,10 +228,37 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn attach_workspace(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    // Capture the forwarding action so upstream registration order cannot open a search tab first.
+    workspace.register_action_renderer(|div, _, _, cx| {
+        div.capture_action(cx.listener(
+            |workspace, action: &zed_actions::search::NewSearchInDirectory, window, cx| {
+                if !SearchPanelSettings::get_global(cx).enabled {
+                    return;
+                }
+                cx.stop_propagation();
+                let selected_text = workspace
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                    .and_then(|editor| selection_query(editor.read(cx), cx));
+                let panel = ensure_panel(workspace, window, cx);
+                workspace.focus_panel::<SearchPanel>(window, cx);
+                panel.update(cx, |panel, cx| {
+                    panel.filters_visible = true;
+                    panel.included_files_editor.update(cx, |editor, cx| {
+                        editor.set_text(action.directory.clone(), window, cx);
+                    });
+                    panel.excluded_files_editor.update(cx, |editor, cx| {
+                        editor.set_text("", window, cx);
+                    });
+                    panel.deploy(selected_text.as_deref(), window, cx);
+                });
+            },
+        ))
+    });
     if SearchPanelSettings::get_global(cx).enabled {
         cx.spawn_in(window, async move |workspace, cx| {
             let panel = SearchPanel::load(workspace.clone(), cx.clone()).await?;
@@ -258,6 +324,7 @@ impl SearchPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let query_editor = new_input("Search", window, cx);
+        let replacement_editor = new_input("Replace", window, cx);
         let included_files_editor = new_input("e.g. src/**/*.rs", window, cx);
         let excluded_files_editor = new_input("e.g. **/vendor/**", window, cx);
         let focus_handle = cx.focus_handle();
@@ -275,6 +342,15 @@ impl SearchPanel {
                 }),
             );
         }
+        subscriptions.push(cx.subscribe(
+            &replacement_editor,
+            |this, _, event: &editor::EditorEvent, cx| {
+                if matches!(event, editor::EditorEvent::Edited { .. }) {
+                    this.panels_with_errors.remove(&InputPanel::Replacement);
+                    cx.notify();
+                }
+            },
+        ));
         subscriptions.push(cx.on_focus(&focus_handle, window, |this, window, cx| {
             this.query_editor.focus_handle(cx).focus(window, cx);
         }));
@@ -285,6 +361,11 @@ impl SearchPanel {
             focus_handle,
             results_focus_handle: cx.focus_handle(),
             query_editor,
+            replacement_editor,
+            replace_visible: false,
+            preserve_case: false,
+            active_query: None,
+            replacement_task: None,
             included_files_editor,
             excluded_files_editor,
             search_options: SearchOptions::from_settings(
@@ -317,6 +398,7 @@ impl SearchPanel {
     }
 
     fn reset_results(&mut self) {
+        self.active_query = None;
         self.results.clear();
         self.rows.clear();
         self.selected_row = None;
@@ -369,6 +451,7 @@ impl SearchPanel {
             cx.notify();
             return;
         };
+        self.active_query = Some(query.clone());
         let search = self
             .project
             .update(cx, |project, cx| project.search(query, cx));
@@ -479,6 +562,7 @@ impl SearchPanel {
             InputPanel::Include => &self.included_files_editor,
             InputPanel::Exclude => &self.excluded_files_editor,
             InputPanel::Query => &self.query_editor,
+            InputPanel::Replacement => &self.replacement_editor,
         };
         let text = editor.read(cx).text(cx);
         let patterns = split_glob_patterns(&text)
@@ -747,6 +831,150 @@ impl SearchPanel {
         cx.notify();
     }
 
+    fn toggle_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_visible = !self.replace_visible;
+        if self.replace_visible {
+            self.replacement_editor.focus_handle(cx).focus(window, cx);
+        } else {
+            self.query_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn can_replace(&self) -> bool {
+        self.search_state == SearchState::Results && self.replacement_task.is_none()
+    }
+
+    fn replace_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self
+            .selected_row
+            .and_then(|index| self.rows.get(index))
+            .copied();
+        let scope = match row {
+            Some(ResultRow::Match {
+                file_index,
+                match_index,
+            }) => ReplacementScope::Match {
+                file_index,
+                match_index,
+            },
+            Some(ResultRow::File(file_index)) => ReplacementScope::Match {
+                file_index,
+                match_index: 0,
+            },
+            None => return,
+        };
+        self.replace(scope, window, cx);
+    }
+
+    fn replace(&mut self, scope: ReplacementScope, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_replace() {
+            return;
+        }
+        let Some(query) = self.active_query.clone() else {
+            return;
+        };
+        let replacement = self.replacement_editor.read(cx).text(cx);
+        let query = query.with_replacement(replacement.clone());
+        let preserve_case = self.preserve_case;
+        let search_id = self.search_id;
+        let mut targets = Vec::new();
+        for (file_index, file) in self.results.iter().enumerate() {
+            let matches = match scope {
+                ReplacementScope::All => file.matches.clone(),
+                ReplacementScope::File(index) if index == file_index => file.matches.clone(),
+                ReplacementScope::Match {
+                    file_index: index,
+                    match_index,
+                } if index == file_index => {
+                    file.matches.get(match_index).cloned().into_iter().collect()
+                }
+                _ => continue,
+            };
+            if let Some(first) = matches.first() {
+                targets.push(ReplacementTarget {
+                    buffer: first.buffer.clone(),
+                    snapshot: first.buffer.read(cx).snapshot(),
+                    path: file.path_label.clone(),
+                    matches,
+                });
+            }
+        }
+        let count = targets
+            .iter()
+            .map(|target| target.matches.len())
+            .sum::<usize>();
+        if count == 0 {
+            return;
+        }
+        let confirmation = if matches!(scope, ReplacementScope::Match { .. }) {
+            None
+        } else {
+            Some(window.prompt(
+                gpui::PromptLevel::Warning,
+                &format!("Replace {count} matches in {} files?", targets.len()),
+                Some("Changed files open in editor tabs and can be undone per file. This operation does not save them; existing auto-save settings still apply."),
+                &["Replace", "Cancel"],
+                cx,
+            ))
+        };
+        self.panels_with_errors.remove(&InputPanel::Replacement);
+        self.replacement_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let outcome: anyhow::Result<()> = async {
+                if let Some(confirmation) = confirmation {
+                    if confirmation.await? != 0 {
+                        return Ok(());
+                    }
+                }
+                let plans = cx.background_spawn(prepare_replacements(query, targets, preserve_case)).await?;
+                this.update_in(cx, |this, window, cx| {
+                    anyhow::ensure!(
+                        this.search_id == search_id
+                            && this.input_texts(cx) == this.input_texts
+                            && this.replacement_editor.read(cx).text(cx) == replacement
+                            && this.preserve_case == preserve_case,
+                        "Search or replacement changed. Run the replacement again."
+                    );
+                    for plan in &plans {
+                        let buffer = plan.buffer.read(cx);
+                        anyhow::ensure!(buffer.capability().editable(), "{} is read-only", plan.path);
+                        anyhow::ensure!(
+                            &buffer.version() == plan.snapshot.version(),
+                            "{} changed while preparing replacement. Search again before replacing.", plan.path
+                        );
+                    }
+                    // The project buffer store holds weak references, and a new search clears these results.
+                    // Persistent tabs keep unsaved replacements alive after the next search.
+                    this.workspace.update(cx, |workspace, cx| {
+                        for plan in &plans {
+                            workspace.open_project_item::<Editor>(
+                                None, plan.buffer.clone(), false, false, true, false, window, cx,
+                            );
+                        }
+                    })?;
+                    for plan in plans {
+                        plan.buffer.update(cx, |buffer, cx| {
+                            buffer.finalize_last_transaction();
+                            buffer.edit(plan.edits, None, cx);
+                            buffer.finalize_last_transaction();
+                        });
+                    }
+                    this.search(cx);
+                    anyhow::Ok(())
+                })??;
+                Ok(())
+            }.await;
+            this.update(cx, |this, cx| {
+                this.replacement_task = None;
+                if let Err(error) = outcome {
+                    this.panels_with_errors.insert(InputPanel::Replacement, error.to_string());
+                }
+                cx.notify();
+            }).log_err();
+        }));
+        cx.notify();
+    }
+
     fn render_input(&self, input: InputPanel, editor: &Entity<Editor>, cx: &App) -> gpui::Div {
         let theme = cx.theme();
         let border = if self.panels_with_errors.contains_key(&input) {
@@ -771,7 +999,11 @@ impl SearchPanel {
             ..EditorStyle::default()
         };
         h_flex()
-            .key_context("fork_search_input")
+            .key_context(if input == InputPanel::Replacement {
+                "fork_replace_input"
+            } else {
+                "fork_search_input"
+            })
             .w_full()
             .min_w_0()
             .min_h_8()
@@ -897,6 +1129,18 @@ impl SearchPanel {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
+                .when(self.replace_visible, |row| {
+                    row.child(
+                        IconButton::new(("replace-file", file_index), IconName::ReplaceAll)
+                            .shape(IconButtonShape::Square)
+                            .disabled(!self.can_replace())
+                            .tooltip(Tooltip::text("Replace All in File"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.replace(ReplacementScope::File(file_index), window, cx);
+                            })),
+                    )
+                })
                 .tooltip(Tooltip::text(file.path_label.clone()))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.selected_row = Some(index);
@@ -919,16 +1163,32 @@ impl SearchPanel {
                                 .color(Color::Muted),
                         ),
                     )
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            HighlightedLabel::from_ranges(
-                                search_match.preview.clone(),
-                                search_match.highlight_ranges.clone(),
-                            )
-                            .size(LabelSize::Small)
-                            .truncate(),
+                    .child(div().flex_1().min_w_0().child(
+                        LabelLike::new().size(LabelSize::Small).truncate().child(
+                            StyledText::new(search_match.preview.clone()).with_highlights(
+                                search_match_highlights(&search_match.highlight_ranges, cx),
+                            ),
                         ),
-                    )
+                    ))
+                    .when(self.replace_visible, |row| {
+                        row.child(
+                            IconButton::new(("replace-match", index), IconName::ReplaceNext)
+                                .shape(IconButtonShape::Square)
+                                .disabled(!self.can_replace())
+                                .tooltip(Tooltip::text("Replace Match"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.replace(
+                                        ReplacementScope::Match {
+                                            file_index,
+                                            match_index,
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_row(index, cx);
                         this.open_match(file_index, match_index, false, window, cx);
@@ -937,6 +1197,21 @@ impl SearchPanel {
             }
         }
     }
+}
+
+fn search_match_highlights(
+    ranges: &[Range<usize>],
+    cx: &App,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let highlight = HighlightStyle {
+        background_color: Some(cx.theme().colors().search_match_background),
+        ..Default::default()
+    };
+    ranges
+        .iter()
+        .cloned()
+        .map(|range| (range, highlight))
+        .collect()
 }
 
 fn new_input(placeholder: &'static str, window: &mut Window, cx: &mut App) -> Entity<Editor> {
@@ -1015,6 +1290,85 @@ fn match_preview(line: &str, range: Range<usize>) -> (SharedString, Vec<Range<us
     (preview.into(), highlights)
 }
 
+async fn prepare_replacements(
+    query: SearchQuery,
+    targets: Vec<ReplacementTarget>,
+    preserve_case: bool,
+) -> anyhow::Result<Vec<ReplacementPlan>> {
+    let mut plans = Vec::new();
+    for target in targets {
+        let ReplacementTarget {
+            buffer,
+            snapshot,
+            path,
+            matches,
+        } = target;
+        anyhow::ensure!(snapshot.capability.editable(), "{path} is read-only");
+        let current_matches = query.search(&snapshot, None).await;
+        let text = snapshot.text();
+        let mut edits = Vec::new();
+        for search_match in matches {
+            let range = snapshot.summary_for_anchor::<usize>(&search_match.range.start)
+                ..snapshot.summary_for_anchor::<usize>(&search_match.range.end);
+            anyhow::ensure!(
+                text.get(range.clone()) == Some(search_match.matched_text.as_ref())
+                    && current_matches
+                        .binary_search_by_key(&(range.start, range.end), |hit| (hit.start, hit.end))
+                        .is_ok(),
+                "Search results in {path} are out of date. Search again before replacing."
+            );
+            let replacement = query
+                .replacement_for(&text, range.clone())
+                .ok_or_else(|| anyhow::anyhow!("Could not expand replacement in {path}"))?;
+            let replacement = if preserve_case {
+                preserve_replacement_case(search_match.matched_text.as_ref(), &replacement)
+            } else {
+                replacement.into_owned()
+            };
+            edits.push((range, replacement));
+        }
+        edits.sort_by_key(|(range, _)| (range.start, range.end));
+        plans.push(ReplacementPlan {
+            buffer,
+            snapshot,
+            path,
+            edits,
+        });
+    }
+    Ok(plans)
+}
+
+fn preserve_replacement_case(matched: &str, replacement: &str) -> String {
+    let mut letters = matched
+        .chars()
+        .filter(|character| character.is_uppercase() || character.is_lowercase());
+    let Some(first) = letters.next() else {
+        return replacement.to_owned();
+    };
+    let remaining = letters.collect::<Vec<_>>();
+    if first.is_uppercase() && remaining.iter().all(|character| character.is_uppercase()) {
+        replacement.to_uppercase()
+    } else if first.is_lowercase() && remaining.iter().all(|character| character.is_lowercase()) {
+        replacement.to_lowercase()
+    } else if first.is_uppercase() && remaining.iter().all(|character| character.is_lowercase()) {
+        let mut capitalized = false;
+        replacement
+            .to_lowercase()
+            .chars()
+            .flat_map(|character| {
+                if !capitalized && character.is_lowercase() {
+                    capitalized = true;
+                    character.to_uppercase().collect::<Vec<_>>()
+                } else {
+                    vec![character]
+                }
+            })
+            .collect()
+    } else {
+        replacement.to_owned()
+    }
+}
+
 fn build_file_results(
     buffer: Entity<Buffer>,
     ranges: Vec<Range<Anchor>>,
@@ -1050,6 +1404,10 @@ fn build_file_results(
                 match_preview(&line, start.column as usize..highlight_end as usize);
             PanelMatch {
                 buffer: buffer.clone(),
+                matched_text: snapshot
+                    .text_for_range(range.clone())
+                    .collect::<String>()
+                    .into(),
                 range,
                 line_number: start.row + 1,
                 preview,
@@ -1078,17 +1436,53 @@ impl Render for SearchPanel {
                     .child(self.render_option(SearchOption::WholeWord, cx))
                     .child(self.render_option(SearchOption::Regex, cx)),
             );
-        let errors = [InputPanel::Query, InputPanel::Include, InputPanel::Exclude]
-            .into_iter()
-            .filter_map(|input| self.panels_with_errors.get(&input))
-            .map(|error| {
-                Label::new(error.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
-            })
-            .collect::<Vec<_>>();
+        let replacement_input = self.replace_visible.then(|| {
+            h_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    self.render_input(InputPanel::Replacement, &self.replacement_editor, cx)
+                        .flex_1()
+                        .child(
+                            Button::new("preserve-case", "AB")
+                                .style(ButtonStyle::Transparent)
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::Small)
+                                .toggle_state(self.preserve_case)
+                                .tooltip(Tooltip::text("Preserve Case"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.preserve_case = !this.preserve_case;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    IconButton::new("replace-all", IconName::ReplaceAll)
+                        .shape(IconButtonShape::Square)
+                        .disabled(!self.can_replace())
+                        .tooltip(Tooltip::text("Replace All"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.replace(ReplacementScope::All, window, cx)
+                        })),
+                )
+        });
+        let errors = [
+            InputPanel::Query,
+            InputPanel::Replacement,
+            InputPanel::Include,
+            InputPanel::Exclude,
+        ]
+        .into_iter()
+        .filter_map(|input| self.panels_with_errors.get(&input))
+        .map(|error| {
+            Label::new(error.clone())
+                .size(LabelSize::Small)
+                .color(Color::Error)
+        })
+        .collect::<Vec<_>>();
         let filters = self.filters_visible.then(|| {
             v_flex()
+                .pl_7()
                 .gap_1()
                 .child(
                     Label::new("files to include")
@@ -1146,6 +1540,19 @@ impl Render for SearchPanel {
             .size_full()
             .min_w_0()
             .bg(cx.theme().colors().panel_background)
+            .on_action(
+                cx.listener(|this, _: &ToggleReplace, window, cx| this.toggle_replace(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &TogglePreserveCase, _, cx| {
+                this.preserve_case = !this.preserve_case;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ReplaceSelected, window, cx| {
+                this.replace_selected(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ReplaceAll, window, cx| {
+                this.replace(ReplacementScope::All, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &Search, _, cx| this.search(cx)))
             .on_action(cx.listener(|this, _: &Clear, window, cx| this.clear(window, cx)))
             .on_action(
@@ -1191,7 +1598,35 @@ impl Render for SearchPanel {
                     .flex_none()
                     .px_3()
                     .gap_1()
-                    .child(query_input)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                IconButton::new(
+                                    "toggle-replace",
+                                    if self.replace_visible {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    },
+                                )
+                                .shape(IconButtonShape::Square)
+                                .toggle_state(self.replace_visible)
+                                .tooltip(Tooltip::text("Toggle Replace"))
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| this.toggle_replace(window, cx),
+                                )),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(query_input)
+                                    .children(replacement_input),
+                            ),
+                    )
                     .child(
                         h_flex().justify_end().child(
                             IconButton::new("filters", IconName::Ellipsis)
@@ -1433,6 +1868,207 @@ mod tests {
 
     fn count(panel: &Entity<SearchPanel>, cx: &VisualTestContext) -> usize {
         panel.read_with(cx, |panel, _| panel.match_count())
+    }
+
+    async fn add_project_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<project_panel::ProjectPanel> {
+        let panel = workspace
+            .update_in(cx, |_, window, cx| {
+                cx.spawn_in(window, async move |workspace, cx| {
+                    project_panel::ProjectPanel::load(workspace, cx.clone()).await
+                })
+            })
+            .await
+            .expect("project panel should load");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        panel
+    }
+
+    fn find_in_folder(
+        workspace: &Entity<Workspace>,
+        project_panel: &Entity<project_panel::ProjectPanel>,
+        path: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project_path = workspace
+                .project()
+                .read(cx)
+                .find_project_path(path, cx)
+                .expect("selected path should exist");
+            workspace.focus_panel::<project_panel::ProjectPanel>(window, cx);
+            project_panel.update(cx, |panel, cx| {
+                panel.select_path_for_test(project_path, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(project_panel::NewSearchInDirectory);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_find_in_folder_routes_to_sidebar(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup(cx).await;
+        let project_panel = add_project_panel(&workspace, cx).await;
+        perform_search(
+            &panel,
+            "needle",
+            SearchOptions::empty(),
+            "one.rs",
+            "*.rs",
+            cx,
+        );
+        let item_count = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_pane().read(cx).items_len()
+        });
+        for path in [path!("/project/src"), path!("/project/src/two.rs")] {
+            find_in_folder(&workspace, &project_panel, path, cx);
+            panel.read_with(cx, |panel, cx| {
+                assert!(panel.filters_visible);
+                assert_eq!(panel.query_text(cx), "needle");
+                assert_eq!(panel.included_files_editor.read(cx).text(cx), "src");
+                assert_eq!(panel.excluded_files_editor.read(cx).text(cx), "");
+                assert_eq!(panel.match_count(), 1);
+                assert!(
+                    panel
+                        .results
+                        .iter()
+                        .all(|file| file.path_label.as_ref() == "src/two.rs")
+                );
+            });
+            cx.update(|window, cx| {
+                assert!(
+                    panel
+                        .read(cx)
+                        .query_editor
+                        .focus_handle(cx)
+                        .is_focused(window)
+                );
+            });
+        }
+        find_in_folder(&workspace, &project_panel, path!("/project/one.rs"), cx);
+        assert_eq!(count(&panel, cx), 5);
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.included_files_editor.read(cx).text(cx), "");
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active_pane().read(cx).items_len(), item_count);
+            assert!(
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .all(|item| { item.downcast::<search::ProjectSearchView>().is_none() })
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_find_in_folder_scopes_multiple_roots(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup(cx).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let filesystem = project.read_with(cx, |project, _| project.fs().as_fake());
+        filesystem
+            .insert_tree(
+                path!("/other"),
+                json!({ "src": { "two.rs": "needle needle" } }),
+            )
+            .await;
+        project
+            .update(cx, |project, cx| {
+                project.create_worktree(path!("/other"), true, cx)
+            })
+            .await
+            .expect("second worktree should load");
+        cx.run_until_parked();
+        let project_panel = add_project_panel(&workspace, cx).await;
+        perform_search(&panel, "needle", SearchOptions::empty(), "", "", cx);
+        for (path, included, matches) in [
+            (path!("/project/src"), "project/src", 1),
+            (path!("/other/src/two.rs"), "other/src", 2),
+            (path!("/other"), "other", 2),
+        ] {
+            find_in_folder(&workspace, &project_panel, path, cx);
+            panel.read_with(cx, |panel, cx| {
+                assert_eq!(panel.included_files_editor.read(cx).text(cx), included);
+                assert_eq!(panel.match_count(), matches);
+                assert!(
+                    panel
+                        .results
+                        .iter()
+                        .all(|file| file.matches.iter().all(|matched| {
+                            matched
+                                .buffer
+                                .read(cx)
+                                .file()
+                                .is_some_and(|file| file.full_path(cx).starts_with(included))
+                        }))
+                );
+            });
+        }
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .all(|item| item.downcast::<search::ProjectSearchView>().is_none())
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_find_in_folder_disabled_fallback_and_reenabled(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_workspace(cx, false).await;
+        let project_panel = add_project_panel(&workspace, cx).await;
+        find_in_folder(&workspace, &project_panel, path!("/project/src"), cx);
+        let view = workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.panel::<SearchPanel>(cx).is_none());
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<search::ProjectSearchView>())
+                .expect("disabled sidebar should fall back to a search tab")
+        });
+        search::project_search::perform_project_search(&view, "needle", cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| {
+                view.results_editor()
+                    .read(cx)
+                    .text(cx)
+                    .matches("needle")
+                    .count()
+            }),
+            1
+        );
+        for enabled in [true, false, true] {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings
+                            .fork
+                            .get_or_insert_default()
+                            .search_panel
+                            .get_or_insert_default()
+                            .enabled = Some(enabled);
+                    });
+                });
+            });
+            cx.run_until_parked();
+            let item_count = workspace.read_with(cx, |workspace, cx| {
+                workspace.active_pane().read(cx).items_len()
+            });
+            find_in_folder(&workspace, &project_panel, path!("/project/src"), cx);
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(workspace.panel::<SearchPanel>(cx).is_some(), enabled);
+                assert_eq!(
+                    workspace.active_pane().read(cx).items_len(),
+                    item_count + usize::from(!enabled)
+                );
+            });
+        }
     }
 
     #[gpui::test]
@@ -1758,6 +2394,55 @@ mod tests {
         }));
     }
 
+    #[gpui::test]
+    async fn test_match_highlights_use_theme_background(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup(cx).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<SearchPanel>(window, cx);
+        });
+        perform_search(&panel, "中文", SearchOptions::empty(), "one.rs", "", cx);
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.match_count(), 1);
+            for matched in panel.results.iter().flat_map(|file| &file.matches) {
+                let highlights = search_match_highlights(&matched.highlight_ranges, cx);
+                assert_eq!(highlights.len(), matched.highlight_ranges.len());
+                for ((range, style), expected_range) in
+                    highlights.iter().zip(&matched.highlight_ranges)
+                {
+                    assert_eq!(range, expected_range);
+                    assert_eq!(matched.preview.get(range.clone()), Some("中文"));
+                    assert_eq!(
+                        style.background_color,
+                        Some(cx.theme().colors().search_match_background)
+                    );
+                    assert_eq!(style.color, None);
+                    assert_eq!(style.font_weight, None);
+                }
+                StyledText::new(matched.preview.clone()).with_highlights(highlights);
+            }
+        });
+        perform_search(
+            &panel,
+            "needle",
+            SearchOptions::CASE_SENSITIVE,
+            "one.rs",
+            "",
+            cx,
+        );
+        panel.read_with(cx, |panel, cx| {
+            for matched in panel.results.iter().flat_map(|file| &file.matches) {
+                for (range, style) in search_match_highlights(&matched.highlight_ranges, cx) {
+                    assert_eq!(matched.preview.get(range), Some("needle"));
+                    assert_eq!(
+                        style.background_color,
+                        Some(cx.theme().colors().search_match_background)
+                    );
+                    assert_eq!(style.color, None);
+                }
+            }
+        });
+    }
+
     #[test]
     fn test_previews_are_utf8_safe_and_keep_matches_visible() {
         let (preview, highlights) = match_preview("  中文 needle", 9..15);
@@ -1785,6 +2470,470 @@ mod tests {
         }
         let (preview, _) = match_preview("  needle", 0..2);
         assert_eq!(preview.as_ref(), "  needle");
+    }
+
+    fn result_buffers(panel: &Entity<SearchPanel>, cx: &VisualTestContext) -> Vec<Entity<Buffer>> {
+        panel.read_with(cx, |panel, _| {
+            panel
+                .results
+                .iter()
+                .filter_map(|file| file.matches.first().map(|hit| hit.buffer.clone()))
+                .collect()
+        })
+    }
+
+    fn set_replacement(panel: &Entity<SearchPanel>, text: &str, cx: &mut VisualTestContext) {
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .replacement_editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_replace_input_focus_and_no_search_restart(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup(cx).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<SearchPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        perform_search(&panel, "needle", SearchOptions::empty(), "", "", cx);
+        let search_id = panel.read_with(cx, |panel, _| panel.search_id);
+        panel.update_in(cx, |panel, window, cx| panel.toggle_replace(window, cx));
+        set_replacement(&panel, "thread", cx);
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.replace_visible);
+            assert_eq!(panel.search_id, search_id);
+            assert_eq!(panel.match_count(), 5);
+        });
+        cx.update(|window, cx| {
+            assert!(
+                panel
+                    .read(cx)
+                    .replacement_editor
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+        panel.update_in(cx, |panel, window, cx| panel.toggle_replace(window, cx));
+        panel.read_with(cx, |panel, cx| {
+            assert!(!panel.replace_visible);
+            assert_eq!(panel.replacement_editor.read(cx).text(cx), "thread");
+        });
+        cx.update(|window, cx| {
+            assert!(
+                panel
+                    .read(cx)
+                    .query_editor
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_replace_single_undo_and_retained_unsaved_buffer(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup(cx).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<SearchPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        perform_search(&panel, "needle", SearchOptions::empty(), "one.rs", "", cx);
+        let buffers = result_buffers(&panel, cx);
+        assert_eq!(buffers.len(), 1);
+        for buffer in buffers {
+            let original = buffer.read_with(cx, |buffer, _| buffer.text());
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, "unsaved ")], None, cx);
+            });
+            perform_search(&panel, "needle", SearchOptions::empty(), "one.rs", "", cx);
+            set_replacement(&panel, "thread", cx);
+            panel.update_in(cx, |panel, window, cx| {
+                panel.toggle_replace(window, cx);
+                panel.replace_selected(window, cx);
+            });
+            cx.run_until_parked();
+            buffer.read_with(cx, |buffer, _| {
+                assert_eq!(
+                    buffer.text(),
+                    format!("unsaved {}", original.replacen("needle", "thread", 1))
+                );
+                assert!(buffer.is_dirty());
+            });
+            assert_eq!(count(&panel, cx), 3);
+            assert!(panel.read_with(cx, |panel, _| panel.panels_with_errors.is_empty()));
+            cx.update(|window, cx| {
+                assert!(
+                    panel
+                        .read(cx)
+                        .replacement_editor
+                        .focus_handle(cx)
+                        .is_focused(window)
+                );
+            });
+            buffer.update(cx, |buffer, cx| {
+                assert!(buffer.undo(cx).is_some());
+            });
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                format!("unsaved {original}")
+            );
+        }
+        panel.update_in(cx, |panel, window, cx| panel.clear(window, cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let editors = workspace.items_of_type::<Editor>(cx).collect::<Vec<_>>();
+            assert_eq!(editors.len(), 1);
+            for editor in editors {
+                assert!(editor.read(cx).text(cx).starts_with("unsaved needle"));
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_replace_all_confirmation_and_preserve_case(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup(cx).await;
+        perform_search(&panel, "needle", SearchOptions::empty(), "", "", cx);
+        let buffers = result_buffers(&panel, cx);
+        assert_eq!(buffers.len(), 2);
+        let originals = buffers
+            .iter()
+            .map(|buffer| buffer.read_with(cx, |buffer, _| buffer.text()))
+            .collect::<Vec<_>>();
+        set_replacement(&panel, "THREAD", cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.preserve_case = true;
+            panel.replace(ReplacementScope::All, window, cx);
+        });
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(count(&panel, cx), 5);
+        for (buffer, original) in buffers.iter().zip(&originals) {
+            assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), *original);
+        }
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<Editor>(cx)
+                .count()),
+            0
+        );
+        panel.update_in(cx, |panel, window, cx| {
+            panel.replace(ReplacementScope::All, window, cx)
+        });
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+        assert_eq!(count(&panel, cx), 0);
+        assert!(panel.read_with(cx, |panel, _| panel.panels_with_errors.is_empty()));
+        for (buffer, original) in buffers.iter().zip(&originals) {
+            buffer.read_with(cx, |buffer, _| {
+                assert_eq!(
+                    buffer.text(),
+                    original
+                        .replace("needle", "thread")
+                        .replace("Needle", "Thread")
+                );
+                assert!(buffer.is_dirty());
+            });
+        }
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<Editor>(cx)
+                .count()),
+            2
+        );
+        let project = panel.read_with(cx, |panel, _| panel.project.clone());
+        let filesystem = project.read_with(cx, |project, _| project.fs().clone());
+        match filesystem.load(path!("/project/one.rs").as_ref()).await {
+            Ok(text) => assert_eq!(text, "needle Needle needles\n  中文 needle\n"),
+            Err(error) => panic!("Could not read test file: {error}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_replace_file_empty_text_and_limit_guard(cx: &mut TestAppContext) {
+        let (_, panel, cx) = setup(cx).await;
+        perform_search(
+            &panel,
+            "needle",
+            SearchOptions::CASE_SENSITIVE,
+            "one.rs",
+            "",
+            cx,
+        );
+        let buffers = result_buffers(&panel, cx);
+        assert_eq!(buffers.len(), 1);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.search_state = SearchState::LimitReached;
+            panel.replace(ReplacementScope::All, window, cx);
+            assert!(panel.replacement_task.is_none());
+            panel.search_state = SearchState::Searching;
+            panel.replace(ReplacementScope::File(0), window, cx);
+            assert!(panel.replacement_task.is_none());
+            panel.search_state = SearchState::Results;
+            panel.replace(ReplacementScope::File(0), window, cx);
+        });
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+        assert_eq!(count(&panel, cx), 0);
+        for buffer in buffers {
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                " Needle s\n  中文 \n"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_replace_regex_captures_context_and_zero_width(cx: &mut TestAppContext) {
+        let (_, panel, cx) = setup(cx).await;
+        perform_search(&panel, "needle", SearchOptions::empty(), "one.rs", "", cx);
+        let buffers = result_buffers(&panel, cx);
+        assert_eq!(buffers.len(), 1);
+        for buffer in buffers {
+            buffer.update(cx, |buffer, cx| {
+                let length = buffer.len();
+                buffer.edit([(0..length, "前中文 前中文")], None, cx);
+            });
+            perform_search(
+                &panel,
+                r"(?<=前)(?<word>中)(文)",
+                SearchOptions::REGEX,
+                "one.rs",
+                "",
+                cx,
+            );
+            assert_eq!(count(&panel, cx), 2);
+            set_replacement(&panel, r"${word}-$2\n", cx);
+            panel.update_in(cx, |panel, window, cx| {
+                panel.replace(ReplacementScope::File(0), window, cx)
+            });
+            cx.simulate_prompt_answer("Replace");
+            cx.run_until_parked();
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "前中-文\n 前中-文\n"
+            );
+            assert!(panel.read_with(cx, |panel, _| panel.panels_with_errors.is_empty()));
+            perform_search(&panel, r"(?=前)", SearchOptions::REGEX, "one.rs", "", cx);
+            assert_eq!(count(&panel, cx), 2);
+            set_replacement(&panel, "注", cx);
+            panel.update_in(cx, |panel, window, cx| {
+                panel.replace(ReplacementScope::All, window, cx)
+            });
+            cx.simulate_prompt_answer("Replace");
+            cx.run_until_parked();
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "注前中-文\n 注前中-文\n"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_replace_rejects_stale_whole_word_context_and_changed_inputs(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, panel, cx) = setup(cx).await;
+        perform_search(
+            &panel,
+            "needle",
+            SearchOptions::WHOLE_WORD,
+            "src/two.rs",
+            "",
+            cx,
+        );
+        let buffers = result_buffers(&panel, cx);
+        assert_eq!(buffers.len(), 1);
+        set_replacement(&panel, "thread", cx);
+        for buffer in buffers {
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(6..6, "s")], None, cx);
+            });
+            panel.update_in(cx, |panel, window, cx| panel.replace_selected(window, cx));
+            cx.run_until_parked();
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "needles\nother\n"
+            );
+            assert!(panel.read_with(cx, |panel, _| {
+                panel
+                    .panels_with_errors
+                    .contains_key(&InputPanel::Replacement)
+            }));
+            perform_search(
+                &panel,
+                "needles",
+                SearchOptions::empty(),
+                "src/two.rs",
+                "",
+                cx,
+            );
+            panel.update_in(cx, |panel, window, cx| {
+                panel.replace(ReplacementScope::All, window, cx);
+                panel
+                    .replacement_editor
+                    .update(cx, |editor, cx| editor.set_text("different", window, cx));
+            });
+            cx.simulate_prompt_answer("Replace");
+            cx.run_until_parked();
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "needles\nother\n"
+            );
+            assert!(panel.read_with(cx, |panel, _| {
+                panel
+                    .panels_with_errors
+                    .contains_key(&InputPanel::Replacement)
+            }));
+            panel.update_in(cx, |panel, window, cx| {
+                panel.replace(ReplacementScope::All, window, cx);
+                panel
+                    .query_editor
+                    .update(cx, |editor, cx| editor.set_text("other", window, cx));
+            });
+            cx.simulate_prompt_answer("Replace");
+            cx.run_until_parked();
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                "needles\nother\n"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_replace_all_preflights_every_buffer(cx: &mut TestAppContext) {
+        let (_, panel, cx) = setup(cx).await;
+        perform_search(&panel, "needle", SearchOptions::empty(), "", "", cx);
+        let buffers = result_buffers(&panel, cx);
+        assert_eq!(buffers.len(), 2);
+        let originals = buffers
+            .iter()
+            .map(|buffer| buffer.read_with(cx, |buffer, _| buffer.text()))
+            .collect::<Vec<_>>();
+        set_replacement(&panel, "thread", cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.replace(ReplacementScope::All, window, cx)
+        });
+        if let Some(buffer) = buffers.last() {
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_capability(language::Capability::ReadOnly, cx)
+            });
+        }
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| {
+            panel
+                .panels_with_errors
+                .contains_key(&InputPanel::Replacement)
+        }));
+        for (buffer, original) in buffers.iter().zip(&originals) {
+            assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), *original);
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_capability(language::Capability::ReadWrite, cx)
+            });
+        }
+        perform_search(&panel, "needle", SearchOptions::empty(), "", "", cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.replace(ReplacementScope::All, window, cx)
+        });
+        if let Some(buffer) = buffers.last() {
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, "changed ")], None, cx);
+            });
+        }
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+        for (index, (buffer, original)) in buffers.iter().zip(&originals).enumerate() {
+            let expected = if index + 1 == buffers.len() {
+                format!("changed {original}")
+            } else {
+                original.clone()
+            };
+            assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), expected);
+        }
+        assert!(panel.read_with(cx, |panel, _| {
+            panel
+                .panels_with_errors
+                .contains_key(&InputPanel::Replacement)
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_replace_keyboard_context_and_confirmation(cx: &mut TestAppContext) {
+        let (workspace, panel, cx) = setup(cx).await;
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("cmd-shift-h", ToggleReplace, Some("ForkSearchPanel")),
+                gpui::KeyBinding::new("enter", Search, Some("fork_search_input > Editor")),
+                gpui::KeyBinding::new(
+                    "enter",
+                    ReplaceSelected,
+                    Some("fork_replace_input > Editor"),
+                ),
+                gpui::KeyBinding::new("cmd-enter", ReplaceAll, Some("fork_replace_input > Editor")),
+            ]);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<SearchPanel>(window, cx);
+        });
+        perform_search(&panel, "needle", SearchOptions::empty(), "one.rs", "", cx);
+        set_replacement(&panel, "thread", cx);
+        cx.simulate_keystrokes("cmd-shift-h");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(count(&panel, cx), 3);
+        assert!(panel.read_with(cx, |panel, _| panel.panels_with_errors.is_empty()));
+        cx.simulate_keystrokes("cmd-enter");
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(count(&panel, cx), 3);
+        cx.simulate_keystrokes("cmd-enter");
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+        assert_eq!(count(&panel, cx), 0);
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .fork
+                        .get_or_insert_default()
+                        .search_panel
+                        .get_or_insert_default()
+                        .search_on_type = Some(false);
+                });
+            });
+        });
+        cx.simulate_keystrokes("cmd-shift-h");
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .query_editor
+                .update(cx, |editor, cx| editor.set_text("thread", window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(count(&panel, cx), 0);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(count(&panel, cx), 4);
+    }
+
+    #[test]
+    fn test_preserve_case_unicode_and_mixed_case() {
+        assert_eq!(preserve_replacement_case("NEEDLE", "thread"), "THREAD");
+        assert_eq!(preserve_replacement_case("needle", "THREAD"), "thread");
+        assert_eq!(preserve_replacement_case("Needle", "tHREAD"), "Thread");
+        assert_eq!(preserve_replacement_case("NeEdLe", "tHREAD"), "tHREAD");
+        assert_eq!(preserve_replacement_case("École", "über"), "Über");
+        assert_eq!(preserve_replacement_case("ÉCOLE", "straße"), "STRASSE");
+        assert_eq!(preserve_replacement_case("中文", "tHREAD"), "tHREAD");
+        assert_eq!(
+            preserve_replacement_case("123Needle", "123tHREAD"),
+            "123Thread"
+        );
+        assert_eq!(preserve_replacement_case("Needle", ""), "");
     }
 
     #[test]
