@@ -23,6 +23,7 @@ pub struct ForkSettingsContent {
     pub git_panel: Option<ForkGitPanelSettingsContent>,
     pub markdown_preview: Option<ForkMarkdownPreviewSettingsContent>,
     pub blame_popover: Option<ForkBlamePopoverSettingsContent>,
+    pub search_panel: Option<ForkSearchPanelSettingsContent>,
 }
 
 #[with_fallible_options]
@@ -197,4 +198,24 @@ pub enum ForkBlamePopoverStyle {
     #[default]
     Zed,
     Gitlens,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ForkSearchPanelSettingsContent {
+    pub enabled: Option<bool>,
+    pub dock: Option<ForkSearchPanelDock>,
+    pub default_width: Option<f32>,
+    pub search_on_type: Option<bool>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkSearchPanelDock {
+    #[default]
+    Left,
+    Right,
+    Bottom,
 }

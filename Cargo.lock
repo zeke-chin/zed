@@ -6550,6 +6550,7 @@ dependencies = [
  "editor",
  "fork_copy_anchor",
  "fork_json_explorer",
+ "fork_search_panel",
  "fork_window_switcher",
  "fork_windsurf",
  "gpui",
@@ -6602,6 +6603,33 @@ dependencies = [
  "settings",
  "theme",
  "theme_settings",
+]
+
+[[package]]
+name = "fork_search_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "db",
+ "editor",
+ "file_icons",
+ "futures 0.3.34",
+ "gpui",
+ "language",
+ "menu",
+ "project",
+ "project_panel",
+ "remote_connection",
+ "search",
+ "serde_json",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
 ]
 
 [[package]]
