@@ -10,6 +10,10 @@ on:
         description: 要构建的分支、tag 或提交，留空则构建触发时选的分支
         type: string
         default: ''
+      release:
+        description: 构建完把产物发到 GitHub Release（tag 为 fork-<提交短哈希>）
+        type: boolean
+        default: true
   push:
     tags:
     - fork-v*
@@ -205,8 +209,8 @@ jobs:
         if-no-files-found: error
 
   publish_release:
-    # 只有推送 fork-v* tag 时才发 GitHub Release；手动触发只留 Actions 产物。
-    if: startsWith(github.ref, 'refs/tags/fork-v')
+    # 推送 fork-v* tag 时用该 tag 发布；手动触发且勾选 release 时按构建的提交发布到 fork-<短哈希>。
+    if: startsWith(github.ref, 'refs/tags/fork-v') || (github.event_name == 'workflow_dispatch' && inputs.release)
     needs: [bundle_linux, bundle_mac, bundle_windows]
     runs-on: ubuntu-24.04
     permissions:
@@ -217,15 +221,34 @@ jobs:
       with:
         path: dist
         merge-multiple: true
-    - name: create_release
+    - name: publish_release
       env:
         GH_TOKEN: ${{ github.token }}
-        TAG: ${{ github.ref_name }}
+        IS_TAG_PUSH: ${{ startsWith(github.ref, 'refs/tags/fork-v') }}
+        BUILD_REF: ${{ inputs.ref || github.ref_name }}
+        BUILD_SHA: ${{ inputs.ref || github.sha }}
       run: |
         set -euo pipefail
         ls -la dist
-        gh release create "$TAG" dist/* \
-          --repo "$GITHUB_REPOSITORY" \
-          --title "$TAG" \
-          --notes "fork 构建，提交 ${GITHUB_SHA}。未签名、未公证：macOS 首次打开需右键「打开」或执行 xattr -dr com.apple.quarantine \"/Applications/Zed Dev.app\"；Windows 会有 SmartScreen 提示。" \
-          --prerelease
+        sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$BUILD_SHA" --jq .sha)"
+        short="${sha:0:10}"
+        if [ "$IS_TAG_PUSH" = "true" ]; then
+          tag="$GITHUB_REF_NAME"
+          title="$GITHUB_REF_NAME"
+        else
+          tag="fork-$short"
+          title="$BUILD_REF @ $short"
+        fi
+        notes="fork 构建：\`$BUILD_REF\` 的提交 $sha，构建记录 $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID。
+        未签名、未公证：macOS 首次打开需右键「打开」或执行 xattr -dr com.apple.quarantine \"/Applications/Zed Dev.app\"；Windows 会有 SmartScreen 提示。"
+        # 同一提交重复构建（重跑、换分支名触发）时更新已有 Release 的产物，不报错。
+        if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+        else
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$sha" \
+            --title "$title" \
+            --notes "$notes" \
+            --prerelease
+        fi
