@@ -5,6 +5,8 @@ pub(crate) mod mac_only_instance;
 mod migrate;
 #[cfg(target_os = "macos")]
 pub(crate) mod move_to_applications;
+// FORK: Keep per-invocation CLI window selection isolated from upstream opening logic.
+mod fork_open_target;
 mod open_listener;
 mod open_url_modal;
 mod quick_action_bar;
@@ -8963,7 +8965,558 @@ mod tests {
             user_data_dir: None,
             dev_container: false,
             cwd: None,
+            // FORK: Existing tests/internal requests retain non-interactive behavior.
+            interactive: false,
         }
+    }
+
+    // FORK: Exercise the real CLI handler with GPUI-tracked, in-memory channels instead of OS threads.
+    struct ForkCliResponses(mpsc::UnboundedSender<cli::CliResponse>);
+
+    impl cli::CliResponseSink for ForkCliResponses {
+        fn send(&self, response: cli::CliResponse) -> anyhow::Result<()> {
+            self.0
+                .unbounded_send(response)
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        }
+    }
+
+    fn fork_start_cli(
+        mut request: cli::CliRequest,
+        app_state: Arc<AppState>,
+        cx: &mut TestAppContext,
+    ) -> (
+        mpsc::UnboundedSender<cli::CliRequest>,
+        mpsc::UnboundedReceiver<cli::CliResponse>,
+        gpui::Task<()>,
+    ) {
+        if let cli::CliRequest::Open { interactive, .. } = &mut request {
+            *interactive = true;
+        }
+        fork_start_cli_with_capability(request, app_state, cx)
+    }
+
+    fn fork_start_cli_with_capability(
+        request: cli::CliRequest,
+        app_state: Arc<AppState>,
+        cx: &mut TestAppContext,
+    ) -> (
+        mpsc::UnboundedSender<cli::CliRequest>,
+        mpsc::UnboundedReceiver<cli::CliResponse>,
+        gpui::Task<()>,
+    ) {
+        let (request_sender, requests) = mpsc::unbounded();
+        let (response_sender, responses) = mpsc::unbounded();
+        let task = cx.spawn(|mut cx| async move {
+            open_listener::handle_cli_request(
+                request,
+                requests,
+                Box::new(ForkCliResponses(response_sender)),
+                app_state,
+                &mut cx,
+            )
+            .await;
+        });
+        (request_sender, responses, task)
+    }
+
+    async fn fork_cli_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<AppState>,
+        WindowHandle<MultiWorkspace>,
+        WindowHandle<MultiWorkspace>,
+    ) {
+        let app_state = init_startup_test(cx).await;
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.enabled = true;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/projects"),
+                json!({
+                    "alpha": { "child": {}, "file.txt": "alpha" }, "outside.txt": "outside", "bravo": {},
+                    "charlie": {}, "delta": {}, "echo": {}, "foxtrot": {}, "new (3)": {}
+                }),
+            )
+            .await;
+        app_state
+            .fs
+            .save(paths::settings_file(), &"{}".into(), Default::default())
+            .await
+            .expect("save test settings");
+        let first = open_test_project_window_with_tabs(
+            &app_state,
+            Path::new(path!("/projects/alpha")),
+            &[],
+            cx,
+        )
+        .await;
+        let second = open_test_project_window_with_tabs(
+            &app_state,
+            Path::new(path!("/projects/bravo")),
+            &[],
+            cx,
+        )
+        .await;
+        (app_state, first, second)
+    }
+
+    async fn fork_cli_exit(
+        responses: &mut mpsc::UnboundedReceiver<cli::CliResponse>,
+    ) -> (i32, Vec<String>) {
+        let mut errors = Vec::new();
+        while let Some(response) = responses.next().await {
+            match response {
+                cli::CliResponse::Exit { status } => return (status, errors),
+                cli::CliResponse::Stderr { message } => errors.push(message),
+                cli::CliResponse::Ping | cli::CliResponse::Stdout { .. } => {}
+                response => panic!("unexpected CLI prompt: {response:?}"),
+            }
+        }
+        panic!("CLI response channel closed without Exit")
+    }
+
+    async fn fork_cli_prompt(
+        responses: &mut mpsc::UnboundedReceiver<cli::CliResponse>,
+    ) -> (String, Vec<cli::CliWindowEntry>) {
+        match responses.next().await.expect("CLI prompt") {
+            cli::CliResponse::PromptOpenTarget {
+                target_name,
+                windows,
+            } => (target_name, windows),
+            response => panic!("expected open target prompt, got {response:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cli_open_target_window_retains_original_projects(cx: &mut TestAppContext) {
+        let (app_state, first, second) = fork_cli_fixture(cx).await;
+        for auto_open in [false, true] {
+            cx.update(|cx| {
+                let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+                settings.threads_sidebar.auto_open = auto_open;
+                agent_settings::AgentSettings::override_global(settings, cx);
+            });
+            let root = if auto_open {
+                path!("/projects/delta")
+            } else {
+                path!("/projects/charlie")
+            };
+            let before = first
+                .read_with(cx, |multi_workspace, cx| {
+                    multi_workspace
+                        .workspace()
+                        .read(cx)
+                        .root_paths(cx)
+                        .iter()
+                        .map(|path| path.to_path_buf())
+                        .collect::<Vec<_>>()
+                })
+                .expect("first window");
+            let (requests, mut responses, task) = fork_start_cli(
+                cli_open_request(&[root], &[], cli::OpenBehavior::Default, None),
+                app_state.clone(),
+                cx,
+            );
+            let (target_name, _) = fork_cli_prompt(&mut responses).await;
+            assert_eq!(target_name, if auto_open { "delta" } else { "charlie" });
+            requests
+                .unbounded_send(cli::CliRequest::SetOpenTarget {
+                    target: cli::CliOpenTarget::Window(second.window_id().as_u64()),
+                })
+                .expect("select second window");
+            assert_eq!(fork_cli_exit(&mut responses).await, (0, Vec::new()));
+            task.await;
+            second
+                .read_with(cx, |multi_workspace, cx| {
+                    assert_eq!(
+                        multi_workspace
+                            .workspace()
+                            .read(cx)
+                            .root_paths(cx)
+                            .iter()
+                            .map(|path| path.to_path_buf())
+                            .collect::<Vec<_>>(),
+                        vec![PathBuf::from(root)]
+                    );
+                    let keys = multi_workspace.project_group_keys();
+                    for path in [path!("/projects/bravo"), root] {
+                        assert!(
+                            keys.iter()
+                                .any(|key| key.path_list().paths().contains(&PathBuf::from(path))),
+                            "missing retained project {path}: {keys:?}"
+                        );
+                    }
+                    assert_eq!(multi_workspace.sidebar_open(), auto_open);
+                })
+                .expect("second window retained");
+            assert_eq!(
+                first
+                    .read_with(cx, |multi_workspace, cx| multi_workspace
+                        .workspace()
+                        .read(cx)
+                        .root_paths(cx)
+                        .iter()
+                        .map(|path| path.to_path_buf())
+                        .collect::<Vec<_>>())
+                    .expect("first window unchanged"),
+                before
+            );
+            assert_eq!(cx.read(|cx| cx.active_window()), Some(second.into()));
+        }
+        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(
+            app_state
+                .fs
+                .load(paths::settings_file())
+                .await
+                .expect("read settings"),
+            "{}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cli_open_target_new_window(cx: &mut TestAppContext) {
+        let (app_state, _, _) = fork_cli_fixture(cx).await;
+        let (requests, mut responses, task) = fork_start_cli(
+            cli_open_request(
+                &[path!("/projects/charlie")],
+                &[],
+                cli::OpenBehavior::Default,
+                None,
+            ),
+            app_state.clone(),
+            cx,
+        );
+        fork_cli_prompt(&mut responses).await;
+        requests
+            .unbounded_send(cli::CliRequest::SetOpenTarget {
+                target: cli::CliOpenTarget::NewWindow,
+            })
+            .expect("choose new window");
+        assert_eq!(fork_cli_exit(&mut responses).await, (0, Vec::new()));
+        task.await;
+        assert_eq!(cx.windows().len(), 3);
+        assert_eq!(
+            active_window_roots(cx),
+            vec![PathBuf::from(path!("/projects/charlie"))]
+        );
+        assert_eq!(
+            app_state
+                .fs
+                .load(paths::settings_file())
+                .await
+                .expect("read settings"),
+            "{}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cli_open_target_cancel_and_disconnect(cx: &mut TestAppContext) {
+        let (app_state, _, _) = fork_cli_fixture(cx).await;
+        let before = startup_windows(cx);
+        for disconnect in [false, true] {
+            let (requests, mut responses, task) = fork_start_cli(
+                cli_open_request(
+                    &[path!("/projects/charlie")],
+                    &[],
+                    cli::OpenBehavior::Default,
+                    None,
+                ),
+                app_state.clone(),
+                cx,
+            );
+            fork_cli_prompt(&mut responses).await;
+            if !disconnect {
+                requests
+                    .unbounded_send(cli::CliRequest::SetOpenTarget {
+                        target: cli::CliOpenTarget::Cancel,
+                    })
+                    .expect("cancel open");
+            }
+            drop(requests);
+            assert_eq!(fork_cli_exit(&mut responses).await, (130, Vec::new()));
+            task.await;
+            assert_eq!(startup_windows(cx), before);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cli_open_target_invalid_and_closed_window(cx: &mut TestAppContext) {
+        let (app_state, _, second) = fork_cli_fixture(cx).await;
+        for close_window in [false, true] {
+            let (requests, mut responses, task) = fork_start_cli(
+                cli_open_request(
+                    &[path!("/projects/charlie")],
+                    &[],
+                    cli::OpenBehavior::Default,
+                    None,
+                ),
+                app_state.clone(),
+                cx,
+            );
+            fork_cli_prompt(&mut responses).await;
+            let window_id = if close_window {
+                second
+                    .update(cx, |_, window, _| window.remove_window())
+                    .expect("close selected window");
+                second.window_id().as_u64()
+            } else {
+                u64::MAX
+            };
+            let before = startup_windows(cx);
+            requests
+                .unbounded_send(cli::CliRequest::SetOpenTarget {
+                    target: cli::CliOpenTarget::Window(window_id),
+                })
+                .expect("select unavailable window");
+            let (status, errors) = fork_cli_exit(&mut responses).await;
+            assert_eq!(status, 1);
+            assert_eq!(errors.len(), 1);
+            assert!(
+                errors
+                    .first()
+                    .is_some_and(|message| message.contains("no longer available"))
+            );
+            task.await;
+            assert_eq!(startup_windows(cx), before);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cli_open_target_gates(cx: &mut TestAppContext) {
+        let (app_state, _, _) = fork_cli_fixture(cx).await;
+        app_state
+            .fs
+            .save(
+                paths::settings_file(),
+                &r#"{"cli_default_open_behavior":"existing_window"}"#.into(),
+                Default::default(),
+            )
+            .await
+            .expect("configure default");
+        for (root, behavior, interactive) in [
+            (
+                path!("/projects/charlie"),
+                cli::OpenBehavior::Default,
+                false,
+            ),
+            (path!("/projects/delta"), cli::OpenBehavior::AlwaysNew, true),
+            (
+                path!("/projects/echo"),
+                cli::OpenBehavior::ExistingWindow,
+                true,
+            ),
+            (path!("/projects/foxtrot"), cli::OpenBehavior::Add, true),
+            (path!("/projects/echo"), cli::OpenBehavior::Reuse, true),
+            (path!("/projects/new (3)"), cli::OpenBehavior::Classic, true),
+            (
+                path!("/projects/alpha/child"),
+                cli::OpenBehavior::Default,
+                true,
+            ),
+            (
+                path!("/projects/outside.txt"),
+                cli::OpenBehavior::Default,
+                true,
+            ),
+            (
+                path!("/projects/alpha/file.txt:1:1"),
+                cli::OpenBehavior::Default,
+                true,
+            ),
+        ] {
+            let mut request = cli_open_request(&[root], &[], behavior, None);
+            if let cli::CliRequest::Open {
+                interactive: capability,
+                ..
+            } = &mut request
+            {
+                *capability = interactive;
+            }
+            let (_requests, mut responses, task) =
+                fork_start_cli_with_capability(request, app_state.clone(), cx);
+            assert_eq!(
+                fork_cli_exit(&mut responses).await,
+                (0, Vec::new()),
+                "{root}, {behavior:?}"
+            );
+            task.await;
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cli_open_target_no_eligible_windows(cx: &mut TestAppContext) {
+        let (app_state, first, second) = fork_cli_fixture(cx).await;
+        app_state
+            .fs
+            .save(
+                paths::settings_file(),
+                &r#"{"cli_default_open_behavior":"existing_window"}"#.into(),
+                Default::default(),
+            )
+            .await
+            .expect("configure default");
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.enabled = false;
+            agent_settings::AgentSettings::override_global(settings, cx);
+            assert!(fork_open_target::collect_windows(cx).is_empty());
+        });
+        let (_requests, mut responses, task) = fork_start_cli(
+            cli_open_request(
+                &[path!("/projects/charlie")],
+                &[],
+                cli::OpenBehavior::Default,
+                None,
+            ),
+            app_state.clone(),
+            cx,
+        );
+        assert_eq!(fork_cli_exit(&mut responses).await, (0, Vec::new()));
+        task.await;
+        for handle in cx.windows() {
+            handle
+                .update(cx, |_, window, _| window.remove_window())
+                .expect("close test window");
+        }
+        assert!(first.read_with(cx, |_, _| ()).is_err());
+        assert!(second.read_with(cx, |_, _| ()).is_err());
+        let (_requests, mut responses, task) = fork_start_cli(
+            cli_open_request(
+                &[path!("/projects/delta")],
+                &[],
+                cli::OpenBehavior::Default,
+                None,
+            ),
+            app_state,
+            cx,
+        );
+        assert_eq!(fork_cli_exit(&mut responses).await, (0, Vec::new()));
+        task.await;
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_cli_open_target_order_and_project_names(cx: &mut TestAppContext) {
+        use project::ProjectGroupKey;
+        use remote::{
+            DockerConnectionOptions, RemoteConnectionOptions, SshConnectionOptions,
+            WslConnectionOptions,
+        };
+        use workspace::{PathList, SerializedProjectGroupState};
+        let (app_state, first, second) = fork_cli_fixture(cx).await;
+        let project = Project::test(
+            app_state.fs.clone(),
+            [Path::new(path!("/projects/charlie"))],
+            cx,
+        )
+        .await;
+        first
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project, window, cx);
+                let keys = [
+                    ProjectGroupKey::new(None, PathList::new(&[path!("/one/tools")])),
+                    ProjectGroupKey::new(None, PathList::new(&[path!("/two/tools")])),
+                    ProjectGroupKey::new(
+                        Some(RemoteConnectionOptions::Ssh(SshConnectionOptions {
+                            host: "dev-box".into(),
+                            nickname: Some("development".into()),
+                            ..Default::default()
+                        })),
+                        PathList::new(&[path!("/srv/infra")]),
+                    ),
+                    ProjectGroupKey::new(
+                        Some(RemoteConnectionOptions::Wsl(WslConnectionOptions {
+                            distro_name: "Ubuntu".into(),
+                            user: None,
+                        })),
+                        PathList::new(&[path!("/srv/linux")]),
+                    ),
+                    ProjectGroupKey::new(
+                        Some(RemoteConnectionOptions::Docker(DockerConnectionOptions {
+                            name: "container".into(),
+                            ..Default::default()
+                        })),
+                        PathList::new(&[path!("/srv/service")]),
+                    ),
+                ];
+                multi_workspace.restore_project_groups(
+                    keys.into_iter()
+                        .map(|key| SerializedProjectGroupState {
+                            key,
+                            expanded: false,
+                        })
+                        .collect(),
+                    cx,
+                );
+            })
+            .expect("add named sidebar groups");
+        let (requests, mut responses, task) = fork_start_cli(
+            cli_open_request(
+                &[path!("/projects/new (3)")],
+                &[],
+                cli::OpenBehavior::Default,
+                None,
+            ),
+            app_state,
+            cx,
+        );
+        let (target_name, entries) = fork_cli_prompt(&mut responses).await;
+        assert_eq!(target_name, "new (3)");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.window_id)
+                .collect::<Vec<_>>(),
+            cx.windows()
+                .iter()
+                .map(|handle| handle.window_id().as_u64())
+                .collect::<Vec<_>>()
+        );
+        let first_entry = entries
+            .iter()
+            .find(|entry| entry.window_id == first.window_id().as_u64())
+            .expect("first window listed");
+        assert_eq!(first_entry.title, "charlie");
+        assert_eq!(
+            first_entry.other_projects,
+            vec![
+                "one/tools",
+                "two/tools",
+                "ssh: development infra",
+                "wsl: Ubuntu linux",
+                "docker: container service",
+                "alpha"
+            ]
+        );
+        let second_entry = entries
+            .iter()
+            .find(|entry| entry.window_id == second.window_id().as_u64())
+            .expect("second window listed");
+        assert_eq!(second_entry.title, "bravo");
+        assert!(second_entry.other_projects.is_empty());
+        let first_handle = first.into();
+        let second_handle = second.into();
+        assert_eq!(
+            fork_open_target::ordered_windows(
+                vec![second_handle],
+                vec![first_handle, second_handle]
+            ),
+            vec![second_handle, first_handle]
+        );
+        requests
+            .unbounded_send(cli::CliRequest::SetOpenTarget {
+                target: cli::CliOpenTarget::Cancel,
+            })
+            .expect("close prompt");
+        assert_eq!(fork_cli_exit(&mut responses).await, (130, Vec::new()));
+        task.await;
     }
 
     fn cli_connection(

@@ -613,6 +613,8 @@ pub async fn handle_cli_request(
             user_data_dir: _,
             dev_container,
             cwd,
+            // FORK: Gate terminal window selection on the CLI-provided capability.
+            interactive,
         } => {
             if !urls.is_empty() {
                 cx.update(|cx| {
@@ -645,6 +647,42 @@ pub async fn handle_cli_request(
                 return;
             }
 
+            // FORK: This replaces first-run default prompting only for eligible interactive directory opens.
+            let requesting_window = match super::fork_open_target::resolve_open_target(
+                &paths,
+                interactive,
+                open_behavior,
+                &app_state,
+                responses.as_ref(),
+                &mut requests,
+                cx,
+            )
+            .await
+            {
+                Ok(Some(super::fork_open_target::ResolvedOpenTarget::NewWindow)) => {
+                    open_behavior = cli::OpenBehavior::AlwaysNew;
+                    None
+                }
+                Ok(Some(super::fork_open_target::ResolvedOpenTarget::Window(window))) => {
+                    open_behavior = cli::OpenBehavior::ExistingWindow;
+                    Some(window)
+                }
+                Ok(Some(super::fork_open_target::ResolvedOpenTarget::Cancel)) => {
+                    responses.send(CliResponse::Exit { status: 130 }).log_err();
+                    return;
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    responses
+                        .send(CliResponse::Stderr {
+                            message: format!("{error:#}"),
+                        })
+                        .log_err();
+                    responses.send(CliResponse::Exit { status: 1 }).log_err();
+                    return;
+                }
+            };
+
             if open_behavior == cli::OpenBehavior::Default {
                 match resolve_open_behavior(
                     &paths,
@@ -676,6 +714,8 @@ pub async fn handle_cli_request(
                 diff_paths,
                 diff_all,
                 open_behavior,
+                // FORK: An explicit terminal target overrides upstream window inference.
+                requesting_window,
                 responses.as_ref(),
                 wait,
                 dev_container,
@@ -686,6 +726,16 @@ pub async fn handle_cli_request(
             )
             .await;
 
+            // FORK: A target closed during path loading must reach the CLI, not only the logs.
+            if requesting_window.is_some()
+                && let Err(error) = &open_workspace_result
+            {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: format!("{error:#}"),
+                    })
+                    .log_err();
+            }
             let status = if open_workspace_result.is_err() { 1 } else { 0 };
             responses.send(CliResponse::Exit { status }).log_err();
         }
@@ -693,6 +743,15 @@ pub async fn handle_cli_request(
             // We handle this case in a situation-specific way in
             // resolve_open_behavior
             debug_panic!("unexpected SetOpenBehavior message");
+        }
+        // FORK: Selection replies are consumed only while resolve_open_target is awaiting them.
+        CliRequest::SetOpenTarget { .. } => {
+            responses
+                .send(CliResponse::Stderr {
+                    message: "Unexpected SetOpenTarget message".into(),
+                })
+                .log_err();
+            responses.send(CliResponse::Exit { status: 1 }).log_err();
         }
         CliRequest::DebugState => {
             // Deliberately does not activate the app: activation redraws
@@ -864,6 +923,8 @@ async fn open_workspaces(
     diff_paths: Vec<[String; 2]>,
     diff_all: bool,
     open_behavior: cli::OpenBehavior,
+    // FORK: Preserve the window chosen by the terminal instead of choosing the frontmost one.
+    requesting_window: Option<WindowHandle<MultiWorkspace>>,
     responses: &dyn CliResponseSink,
     wait: bool,
     dev_container: bool,
@@ -916,7 +977,13 @@ async fn open_workspaces(
     for (location, workspace_paths) in grouped_locations {
         let base_open_options =
             cx.update(|cx| open_options_for_behavior(open_behavior, &location, cx));
+        // FORK: Explicit requesting_window skips upstream pinning and sidebar activation.
+        if let Some(window) = requesting_window {
+            super::fork_open_target::prepare_window(window, cx)?;
+        }
         let open_options = workspace::OpenOptions {
+            // FORK: Keep the selected target authoritative over behavior-derived options.
+            requesting_window: requesting_window.or(base_open_options.requesting_window),
             wait,
             env: env.clone(),
             open_in_dev_container: dev_container,
@@ -2718,6 +2785,8 @@ mod tests {
             user_data_dir: None,
             dev_container: false,
             cwd: None,
+            // FORK: Upstream protocol tests remain non-interactive.
+            interactive: false,
         }
     }
 
@@ -2737,6 +2806,8 @@ mod tests {
             user_data_dir: None,
             dev_container: false,
             cwd: None,
+            // FORK: Upstream protocol tests remain non-interactive.
+            interactive: false,
         }
     }
 
@@ -2776,6 +2847,10 @@ mod tests {
                     CliResponse::Ping => {}
                     CliResponse::Stdout { .. } | CliResponse::Stderr { .. } => {}
                     CliResponse::Exit { status } => return Ok(status),
+                    // FORK: This upstream harness must never request per-invocation window selection.
+                    CliResponse::PromptOpenTarget { .. } => {
+                        anyhow::bail!("unexpected open-target prompt")
+                    }
                     CliResponse::PromptOpenBehavior => {
                         prompt_called_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
                         let behavior =

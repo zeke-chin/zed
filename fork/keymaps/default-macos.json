@@ -63,5 +63,12 @@
       "cmd-enter": "fork_search_panel::ReplaceAll",
       "down": "fork_search_panel::FocusResults"
     }
+  },
+  {
+    "context": "ThreadsSidebar && not_searching",
+    "bindings": {
+      "cmd-c": "agents_sidebar::CopyProjectName",
+      "cmd-alt-c": "agents_sidebar::CopyProjectPath"
+    }
   }
 ]
