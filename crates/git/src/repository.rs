@@ -1126,6 +1126,55 @@ pub trait GitRepository: Send + Sync {
 
     fn set_trusted(&self, trusted: bool);
     fn is_trusted(&self) -> bool;
+
+    // FORK: H26. Change statistics for the Git panel's commit hover card. The
+    // default refuses so other implementations don't need to change.
+    fn fork_commit_short_stat(
+        &self,
+        _sha: Oid,
+        _parent: Option<Oid>,
+    ) -> BoxFuture<'_, Result<CommitShortStat>> {
+        async move { anyhow::bail!("commit statistics are not supported by this repository") }
+            .boxed()
+    }
+}
+
+// FORK: H26.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitShortStat {
+    pub files: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+// FORK: H26. Same fields as VS Code's
+// `(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?`.
+// Empty output is an empty commit.
+pub fn fork_parse_short_stat(output: &str) -> Result<CommitShortStat> {
+    let output = output.trim();
+    let mut stat = CommitShortStat::default();
+    if output.is_empty() {
+        return Ok(stat);
+    }
+    for part in output.split(',') {
+        let part = part.trim();
+        let (count, label) = part
+            .split_once(' ')
+            .with_context(|| format!("unexpected shortstat part {part:?}"))?;
+        let count: usize = count
+            .parse()
+            .with_context(|| format!("unexpected shortstat count {part:?}"))?;
+        if label.starts_with("file") {
+            stat.files = count;
+        } else if label.starts_with("insertion") {
+            stat.insertions = count;
+        } else if label.starts_with("deletion") {
+            stat.deletions = count;
+        } else {
+            anyhow::bail!("unexpected shortstat part {part:?}");
+        }
+    }
+    Ok(stat)
 }
 
 pub enum DiffType {
@@ -3500,6 +3549,42 @@ impl GitRepository for RealGitRepository {
 
     fn is_trusted(&self) -> bool {
         self.is_trusted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    // FORK: H26. Merge commits are measured against their first parent, like
+    // the Git panel's graph keeps the first parent in the commit's lane.
+    fn fork_commit_short_stat(
+        &self,
+        sha: Oid,
+        parent: Option<Oid>,
+    ) -> BoxFuture<'_, Result<CommitShortStat>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let sha = sha.to_string();
+                let output = match parent {
+                    Some(parent) => {
+                        let parent = parent.to_string();
+                        git.run(&["diff", "--shortstat", parent.as_str(), sha.as_str()])
+                            .await?
+                    }
+                    // The empty tree's SHA differs between SHA-1 and SHA-256
+                    // repositories, so let git pick it with `--root`.
+                    None => {
+                        git.run(&[
+                            "diff-tree",
+                            "--root",
+                            "--shortstat",
+                            "--no-commit-id",
+                            "-r",
+                            sha.as_str(),
+                        ])
+                        .await?
+                    }
+                };
+                fork_parse_short_stat(&output)
+            })
+            .boxed()
     }
 }
 
@@ -6904,6 +6989,98 @@ mod tests {
             compose_batch_mode_ssh_command(None, None, Some("plink")),
             None,
             "setting GIT_SSH_COMMAND would silently replace the GIT_SSH program"
+        );
+    }
+
+    // FORK: H26.
+    #[test]
+    fn test_fork_parse_short_stat() {
+        let stat = |files, insertions, deletions| CommitShortStat {
+            files,
+            insertions,
+            deletions,
+        };
+        assert_eq!(
+            fork_parse_short_stat(" 6 files changed, 52 insertions(+), 46 deletions(-)\n").unwrap(),
+            stat(6, 52, 46)
+        );
+        assert_eq!(
+            fork_parse_short_stat(" 1 file changed, 1 insertion(+)").unwrap(),
+            stat(1, 1, 0)
+        );
+        assert_eq!(
+            fork_parse_short_stat(" 2 files changed, 3 deletions(-)").unwrap(),
+            stat(2, 0, 3)
+        );
+        assert_eq!(fork_parse_short_stat("").unwrap(), stat(0, 0, 0));
+        assert!(fork_parse_short_stat("garbage").is_err());
+    }
+
+    // FORK: H26.
+    #[gpui::test]
+    async fn test_fork_commit_short_stat(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        let head = || git_command_output(path, ["rev-parse", "HEAD"]);
+        let oid = |sha: String| sha.parse::<Oid>().unwrap();
+
+        fs::write(path.join("a.txt"), "one\ntwo\n").unwrap();
+        fs::write(path.join("b.txt"), "b\n").unwrap();
+        git_command(path, ["add", "."]);
+        git_command(path, ["commit", "-m", "root"]);
+        let root = oid(head());
+
+        fs::write(path.join("a.txt"), "one\nthree\nfour\n").unwrap();
+        git_command(path, ["commit", "-am", "edit"]);
+        let edit = oid(head());
+
+        git_command(path, ["switch", "-c", "side", root.to_string().as_str()]);
+        fs::write(path.join("c.txt"), "c\nc\n").unwrap();
+        git_command(path, ["add", "c.txt"]);
+        git_command(path, ["commit", "-m", "side"]);
+        git_command(path, ["switch", "main"]);
+        git_command(path, ["merge", "--no-ff", "-m", "merge", "side"]);
+        let merge = oid(head());
+
+        git_command(path, ["commit", "--allow-empty", "-m", "empty"]);
+        let empty = oid(head());
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let stat = |files, insertions, deletions| CommitShortStat {
+            files,
+            insertions,
+            deletions,
+        };
+        assert_eq!(
+            repository.fork_commit_short_stat(root, None).await.unwrap(),
+            stat(2, 3, 0)
+        );
+        assert_eq!(
+            repository
+                .fork_commit_short_stat(edit, Some(root))
+                .await
+                .unwrap(),
+            stat(1, 2, 1)
+        );
+        assert_eq!(
+            repository
+                .fork_commit_short_stat(merge, Some(edit))
+                .await
+                .unwrap(),
+            stat(1, 2, 0)
+        );
+        assert_eq!(
+            repository
+                .fork_commit_short_stat(empty, Some(merge))
+                .await
+                .unwrap(),
+            stat(0, 0, 0)
         );
     }
 }

@@ -7265,6 +7265,26 @@ impl Repository {
         })
     }
 
+    // FORK: H27. Like H22, local only and outside the job queue so a hover
+    // card doesn't wait behind a fetch or push.
+    pub fn fork_commit_short_stat(
+        &self,
+        sha: Oid,
+        parent: Option<Oid>,
+        cx: &App,
+    ) -> Task<Result<git::repository::CommitShortStat>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            let state = repository_state
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let RepositoryState::Local(LocalRepositoryState { backend, .. }) = state else {
+                anyhow::bail!("Commit statistics are unavailable for remote repositories");
+            };
+            backend.fork_commit_short_stat(sha, parent).await
+        })
+    }
+
     pub fn show(&mut self, commit: String) -> oneshot::Receiver<Result<CommitDetails>> {
         let id = self.id;
         self.send_job("show", None, move |state, _cx| {
@@ -12036,6 +12056,38 @@ mod tests {
         let error = task
             .await
             .expect_err("remote revision reads must be refused");
+        assert!(error.to_string().contains("remote repositories"));
+    }
+
+    // FORK: H27. NoopProtoClient panics on requests, so this also guards against remote IO.
+    #[gpui::test]
+    async fn test_fork_commit_short_stat_rejects_remote(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ ".git": {}, "a.txt": "text" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let git_store = project.read_with(cx, |project, _| project.git_store().downgrade());
+        let repository = cx.new(|cx| {
+            Repository::remote(
+                RepositoryId(1),
+                Path::new("/remote/project").into(),
+                None,
+                None,
+                PathStyle::Unix,
+                ProjectId(0),
+                rpc::NoopProtoClient::new().into(),
+                git_store,
+                Arc::new(Semaphore::new(1)),
+                cx,
+            )
+        });
+        let task = repository.read_with(cx, |repository, cx| {
+            repository.fork_commit_short_stat(Oid::from_bytes(&[1; 20]).unwrap(), None, cx)
+        });
+        let error = task
+            .await
+            .expect_err("remote commit statistics must be refused");
         assert!(error.to_string().contains("remote repositories"));
     }
 
