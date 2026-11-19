@@ -29,8 +29,8 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
+    FocusHandle, Focusable, KeyContext, ListState, Pixels, Render, SharedString, Task, TaskExt,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
     linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
@@ -91,6 +91,11 @@ gpui::actions!(
         NewThreadInGroup,
         /// Toggles between the thread list and the thread history.
         ToggleThreadHistory,
+        // FORK: project copies are separate actions from editor clipboard operations.
+        /// Copies the selected projects' absolute paths.
+        CopyProjectPath,
+        /// Copies the selected projects' display names.
+        CopyProjectName,
     ]
 );
 
@@ -802,6 +807,11 @@ pub struct Sidebar {
     ///
     /// Note: This is NOT the same as the active item.
     selection: Option<usize>,
+    // FORK: keep project selection stable across folding and list reordering (H32).
+    selected_groups: HashSet<ProjectGroupKey>,
+    selection_anchor: Option<ProjectGroupKey>,
+    drag_start: Option<ProjectGroupKey>,
+    dragged_projects: bool,
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
@@ -967,6 +977,11 @@ impl Sidebar {
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
             contents: SidebarContents::default(),
             selection: None,
+            // FORK: project multi-selection starts empty.
+            selected_groups: HashSet::new(),
+            selection_anchor: None,
+            drag_start: None,
+            dragged_projects: false,
             active_entry: None,
             hovered_thread_index: None,
             rename_target: None,
@@ -1416,6 +1431,24 @@ impl Sidebar {
             return;
         };
         let mw = multi_workspace.read(cx);
+        // FORK: removed groups must not survive in selection or gesture state.
+        let group_keys = mw.project_group_keys();
+        let group_exists = |key: &ProjectGroupKey| group_keys.contains(key);
+        self.selected_groups.retain(group_exists);
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|key| !group_exists(key))
+        {
+            self.selection_anchor = None;
+        }
+        if self
+            .drag_start
+            .as_ref()
+            .is_some_and(|key| !group_exists(key))
+        {
+            self.drag_start = None;
+        }
         let workspaces: Vec<_> = mw.workspaces().cloned().collect();
         let active_workspace = Some(mw.workspace().clone());
 
@@ -2360,6 +2393,10 @@ impl Sidebar {
 
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
+        // FORK: each header tracks gestures using its project identity, not its index.
+        let key_for_drag_start = key.clone();
+        let key_for_drag_move = key.clone();
+        let is_project_selected = self.selected_groups.contains(key);
 
         let color = cx.theme().colors();
         let sidebar_base_bg = if is_sticky {
@@ -2387,6 +2424,12 @@ impl Sidebar {
         };
 
         let base_bg = color.background.blend(sidebar_base_bg);
+        // FORK: selected headers keep their selection color under hover and action fades.
+        let base_bg = if is_project_selected {
+            base_bg.blend(color.ghost_element_selected)
+        } else {
+            base_bg
+        };
 
         let hover_solid = base_bg.blend(color.ghost_element_hover);
         let active_solid = base_bg.blend(color.ghost_element_active);
@@ -2397,7 +2440,7 @@ impl Sidebar {
                 .width(px(92.0))
                 .right(px(-2.0))
                 .gradient_stop(0.7)
-                .when(!has_filter, |this| {
+                .when(!has_filter && !is_project_selected, |this| {
                     this.group_name(group_name_for_gradient.clone())
                 })
         };
@@ -2414,6 +2457,10 @@ impl Sidebar {
             .justify_between()
             .border_1()
             .border_r_2()
+            // FORK: multi-selection is distinct from the active project's text highlight.
+            .when(is_project_selected, |this| {
+                this.bg(color.ghost_element_selected)
+            })
             .map(|this| {
                 if is_focused {
                     this.border_color(color.panel_focused_border)
@@ -2421,7 +2468,7 @@ impl Sidebar {
                     this.border_color(gpui::transparent_black())
                 }
             })
-            .when(!has_filter, |this| {
+            .when(!has_filter && !is_project_selected, |this| {
                 this.hover(|s| s.bg(color.ghost_element_hover))
                     .group_active(&group_name, |s| s.bg(color.ghost_element_active))
             })
@@ -2431,6 +2478,34 @@ impl Sidebar {
                     .min_w_0()
                     .w_full()
                     .gap_1()
+                    .when(!has_filter, |this| {
+                        this.child(
+                            div()
+                                .debug_selector(move || {
+                                    format!("{id_prefix}project-disclosure-{ix}")
+                                })
+                                // FORK: pressing the disclosure must not start a range gesture.
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .when(!is_focused, |this| this.visible_on_hover(&group_name))
+                                .child(
+                                    // FORK: folding is independent of project selection and activation.
+                                    IconButton::new(
+                                        format!("{id_prefix}project-disclosure-{ix}"),
+                                        disclosure_icon,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_collapse(&key_for_toggle, window, cx);
+                                        },
+                                    )),
+                                ),
+                        )
+                    })
                     .child(label)
                     .when_some(self.render_remote_project_icon(ix, host), |this, icon| {
                         this.child(icon)
@@ -2472,17 +2547,6 @@ impl Sidebar {
                                         .color(Color::Accent),
                                 )
                             },
-                        )
-                    })
-                    .when(!has_filter, |this| {
-                        this.child(
-                            div()
-                                .when(!is_focused, |this| this.visible_on_hover(&group_name))
-                                .child(
-                                    Icon::new(disclosure_icon)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                ),
                         )
                     }),
             )
@@ -2526,14 +2590,31 @@ impl Sidebar {
                     menu_handle.toggle(window, cx);
                 }
             })
+            // FORK: command/shift clicks and drag ranges select projects without switching.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    this.drag_start = Some(key_for_drag_start.clone());
+                    this.dragged_projects = false;
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, window, cx| {
+                    if event.pressed_button == Some(gpui::MouseButton::Left)
+                        && let Some(start) = this.drag_start.clone()
+                        && start != key_for_drag_move
+                    {
+                        this.select_project_range(&start, &key_for_drag_move);
+                        this.selection_anchor = Some(start);
+                        this.dragged_projects = true;
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    }
+                }),
+            )
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    // FORK: click focuses the project, secondary-click toggles collapse.
-                    if !event.modifiers().secondary(cx) {
-                        this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
-                    } else if !this.has_filter_query(cx) {
-                        this.toggle_collapse(&key_for_toggle, window, cx);
-                    }
+                    this.click_project_header(&key_for_focus, event.modifiers(), window, cx);
                 }),
             )
             .block_mouse_except_scroll();
@@ -2912,10 +2993,19 @@ impl Sidebar {
                 let this = this.clone();
                 move |_window, cx| {
                     this.update(cx, |sidebar, cx| {
+                        // FORK: a menu outside the selection acts on just its own project.
+                        if let Some(ListEntry::ProjectHeader { key, .. }) =
+                            sidebar.contents.entries.get(ix)
+                        {
+                            if !sidebar.selected_groups.contains(key) {
+                                sidebar.selected_groups.clear();
+                            }
+                            sidebar.selection = Some(ix);
+                        }
                         sidebar.project_header_menu_ix = Some(ix);
                         cx.notify();
                     })
-                    .ok();
+                    .log_err();
                 }
             }))
             .menu(move |window, cx| {
@@ -3195,16 +3285,58 @@ impl Sidebar {
 
                         let project_group_key = project_group_key.clone();
                         let remove_multi_workspace = multi_workspace.clone();
-                        menu.separator().entry("Remove", None, move |window, cx| {
-                            remove_multi_workspace
-                                .update(cx, |multi_workspace, cx| {
-                                    multi_workspace
-                                        .remove_project_group(&project_group_key, window, cx)
-                                        .detach_and_log_err(cx);
-                                })
-                                .ok();
-                            weak_menu.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
-                        })
+                        // FORK: explicit menu handlers preserve Finder-style selection scope.
+                        let copy_path_sidebar = this_for_menu.clone();
+                        let copy_name_sidebar = this_for_menu.clone();
+                        // FORK: build_persistent keeps the menu open on confirm, so copies dismiss it explicitly;
+                        // deferred because keyboard confirm runs the handler while the menu is being updated.
+                        let copy_path_weak_menu = weak_menu.clone();
+                        let copy_name_weak_menu = weak_menu.clone();
+                        menu.separator()
+                            .entry(
+                                "Copy Path",
+                                Some(Box::new(CopyProjectPath)),
+                                move |window, cx| {
+                                    copy_path_sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.copy_projects(false, cx);
+                                        })
+                                        .log_err();
+                                    let copy_path_weak_menu = copy_path_weak_menu.clone();
+                                    window.defer(cx, move |_, cx| {
+                                        copy_path_weak_menu
+                                            .update(cx, |_, cx| cx.emit(DismissEvent))
+                                            .log_err();
+                                    });
+                                },
+                            )
+                            .entry(
+                                "Copy Name",
+                                Some(Box::new(CopyProjectName)),
+                                move |window, cx| {
+                                    copy_name_sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.copy_projects(true, cx);
+                                        })
+                                        .log_err();
+                                    let copy_name_weak_menu = copy_name_weak_menu.clone();
+                                    window.defer(cx, move |_, cx| {
+                                        copy_name_weak_menu
+                                            .update(cx, |_, cx| cx.emit(DismissEvent))
+                                            .log_err();
+                                    });
+                                },
+                            )
+                            .entry("Remove", None, move |window, cx| {
+                                remove_multi_workspace
+                                    .update(cx, |multi_workspace, cx| {
+                                        multi_workspace
+                                            .remove_project_group(&project_group_key, window, cx)
+                                            .detach_and_log_err(cx);
+                                    })
+                                    .ok();
+                                weak_menu.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+                            })
                     });
 
                 let this = this.clone();
@@ -3364,6 +3496,15 @@ impl Sidebar {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        // FORK: the first Escape only clears project multi-selection.
+        if !self.selected_groups.is_empty() {
+            self.selected_groups.clear();
+            self.selection_anchor = None;
+            self.drag_start = None;
+            self.dragged_projects = false;
+            cx.notify();
+            return;
+        }
         if self.rename_target.is_some() {
             self.finish_entry_rename(window, cx);
             return;
@@ -7105,6 +7246,122 @@ impl Sidebar {
         });
     }
 
+    // FORK: all selection gestures share identity-based range semantics (H32).
+    fn select_project_range(&mut self, start: &ProjectGroupKey, end: &ProjectGroupKey) {
+        let headers: Vec<_> = self
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if let ListEntry::ProjectHeader { key, .. } = entry {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let start_index = headers.iter().position(|key| *key == start);
+        let end_index = headers.iter().position(|key| *key == end);
+        self.selected_groups.clear();
+        if let (Some(start_index), Some(end_index)) = (start_index, end_index) {
+            self.selected_groups.extend(
+                headers
+                    .into_iter()
+                    .skip(start_index.min(end_index))
+                    .take(start_index.abs_diff(end_index) + 1)
+                    .cloned(),
+            );
+        } else {
+            self.selected_groups.insert(end.clone());
+        }
+    }
+
+    fn click_project_header(
+        &mut self,
+        key: &ProjectGroupKey,
+        modifiers: gpui::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragged_projects {
+            return;
+        }
+        self.selection = self.contents.entries.iter().position(|entry| {
+            matches!(entry, ListEntry::ProjectHeader { key: entry_key, .. } if entry_key == key)
+        });
+        if modifiers.secondary(cx) {
+            if !self.selected_groups.remove(key) {
+                self.selected_groups.insert(key.clone());
+            }
+            self.selection_anchor = Some(key.clone());
+            self.focus_handle.focus(window, cx);
+        } else if modifiers.shift {
+            let anchor = self.selection_anchor.clone().unwrap_or_else(|| key.clone());
+            self.select_project_range(&anchor, key);
+            self.focus_handle.focus(window, cx);
+        } else {
+            self.selected_groups.clear();
+            self.selection_anchor = Some(key.clone());
+            self.activate_or_open_workspace_for_group(key, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn copy_projects(&self, names: bool, cx: &mut Context<Self>) {
+        let all_groups = self
+            .multi_workspace
+            .upgrade()
+            .map(|multi_workspace| multi_workspace.read(cx).project_group_keys())
+            .unwrap_or_default();
+        let mut paths: Vec<_> = all_groups
+            .iter()
+            .flat_map(|key| key.path_list().paths().iter().cloned())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let details = util::disambiguate::compute_disambiguation_details(&paths, |path, detail| {
+            project::path_suffix(path, detail)
+        });
+        let details: HashMap<_, _> = paths.into_iter().zip(details).collect();
+        let groups = if self.selected_groups.is_empty() {
+            self.selected_group_key().into_iter().collect::<Vec<_>>()
+        } else if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+            multi_workspace
+                .read(cx)
+                .project_group_keys()
+                .iter()
+                .filter(|key| self.selected_groups.contains(*key))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let lines: Vec<_> = groups
+            .iter()
+            .flat_map(|key| {
+                if names {
+                    vec![key.display_name(&details).to_string()]
+                } else {
+                    key.path_list()
+                        .ordered_paths()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect()
+                }
+            })
+            .collect();
+        if !lines.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(lines.join("\n")));
+        }
+    }
+
+    fn copy_project_path(&mut self, _: &CopyProjectPath, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy_projects(false, cx);
+    }
+
+    fn copy_project_name(&mut self, _: &CopyProjectName, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy_projects(true, cx);
+    }
+
     fn selected_group_key(&self) -> Option<ProjectGroupKey> {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
@@ -7988,6 +8245,9 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::cancel))
+            // FORK: editor contexts keep their own deeper copy handlers.
+            .on_action(cx.listener(Self::copy_project_path))
+            .on_action(cx.listener(Self::copy_project_name))
             .on_action(cx.listener(Self::archive_selected_thread))
             .on_action(cx.listener(Self::rename_selected_thread))
             .on_action(cx.listener(Self::new_thread_in_group))
@@ -8061,6 +8321,19 @@ impl Render for Sidebar {
                                     .relative()
                                     .flex_1()
                                     .overflow_hidden()
+                                    // FORK: retain the dragged flag until click delivery; reset on the next press.
+                                    .on_mouse_up(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|this, _, _, _| {
+                                            this.drag_start = None;
+                                        }),
+                                    )
+                                    .on_mouse_up_out(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|this, _, _, _| {
+                                            this.drag_start = None;
+                                        }),
+                                    )
                                     .child(
                                         list(
                                             self.list_state.clone(),

@@ -26,7 +26,7 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H15 | `crates/markdown_preview/Cargo.toml` | 加 `fork_markdown_preview` 依赖 | 同上 |
 | H16 | `crates/markdown/src/markdown.rs` | `MarkdownStyle` 加 `list_layout` / `table_layout` / `heading_layout` / `code_block_layout` / `inline_code_layout` / `block_quote_layout` / `rule_height` 七个字段，并把标题边距、列表缩进与符号、表格边框与斑马纹、代码块与 chip 圆角、引用块左边框、分隔线高度改成读这些字段 | Vditor 的排版和上游硬编码的值不同（列表缩进 2em vs 10px、表格无外框、斑马纹在表体）。字段默认值等于上游原值，所以不设时行为完全不变 |
 | H17 | `crates/workspace/src/multi_workspace.rs` | `MultiWorkspace` 加字段 `fork_new_groups_expanded`（`new` 里为 `false`），`ensure_project_group_state` 新建分组时用它代替 `expanded: true`；`test_new` 把它设为 `true`，另加测试用的 `fork_set_new_groups_expanded` | 侧边栏新项目分组默认折叠（设计文档 11）。`ensure_project_group_state` 是分组状态唯一的创建入口。上游测试都经 `test_new` 构造且大量断言默认展开，让 `test_new` 保持上游行为，上游测试就不用改 |
-| H18 | `crates/sidebar/src/sidebar.rs` | `render_project_header` 的 `on_click` 对调两个分支（单击切到项目，⌘-单击展开/折叠）；`confirm` 落在项目标题上改为切到项目；`…` 菜单「Focus Project」的快捷提示从「⌘-click」改成「click」，并删掉因此不再用的 `Modifiers`、`render_modifiers` 导入 | 把侧边栏当工作区切换器用（设计文档 11） |
+| H18 | `crates/sidebar/src/sidebar.rs` | `render_project_header` 单击切到项目（⌘-单击原为展开/折叠，已由 H32 改为多选，折叠移到箭头）；`confirm` 落在项目标题上改为切到项目；`…` 菜单「Focus Project」的快捷提示从「⌘-click」改成「click」，并删掉因此不再用的 `Modifiers`、`render_modifiers` 导入 | 把侧边栏当工作区切换器用（设计文档 11） |
 | H19 | `crates/sidebar/src/sidebar_tests.rs` | 末尾追加 fork 测试（含补回 `use gpui::Modifiers;`，H18 删了 `sidebar.rs` 里的导入，上游测试靠 `use super::*` 用到它）；上游 `test_keyboard_confirm_on_project_header_toggles_collapse` 按新行为改写 | 同上；Enter 的行为改了，上游这条测试只能跟着改 |
 | H20 | `crates/editor/src/element.rs` | `layout_blame_popover` 把 blame 条目的原始行号收窄到光标行 | diff 需要光标所在行，而不是整个条目的第一行；Git 的原始行号为 1-based |
 | H21 | `crates/editor/src/git/blame.rs` | 加 `fork_row_offset_in_entry` 和 fork 测试 | sum tree 中的条目片段位置会随缓冲区编辑移动，不能直接用 `BlameEntry::range.start` |
@@ -38,6 +38,14 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H26 | `crates/git/src/repository.rs` | `GitRepository` 加 `fork_commit_short_stat`（默认实现报不支持），`RealGitRepository` 用 `git diff --shortstat <第一父提交> <sha>` / 根提交 `git diff-tree --root --shortstat` 实现；`CommitShortStat` 和 `fork_parse_short_stat` 放在 trait 后面；测试模块末尾追加解析和真实仓库测试 | Git 面板 GRAPH 悬浮卡的改动统计（设计文档 9）。上游 `diff_stat` 只支持 HEAD/暂存区/工作区，加枚举变体要改远程协议；默认实现让 `FakeGitRepository` 等不用改 |
 | H27 | `crates/project/src/git_store.rs` | `Repository` 在 `show` 前加 `fork_commit_short_stat`：本地调 H26，远程直接报不支持；测试模块在 H22 测试后追加远程拒绝测试 | 同上；照 H22 用 `background_spawn`，不走 `send_job` 队列，悬浮时不排在 fetch/push 后面 |
 | H28 | `.cargo/config.toml` | `rustflags` 加 `--cfg zed_no_webrtc`、`--cfg zed_no_bedrock`；加 `[build] build-dir = "{workspace-root}/target"` | 两个 cfg 去掉 LiveKit/WebRTC 和 Amazon Bedrock 依赖；`build-dir` 让每个 workspace（含 git worktree）用自己的 `target/`，覆盖用户级共用的 build-dir，worktree 才能并发构建并克隆母本缓存（设计文档 15） |
+| H29 | `crates/cli/src/cli.rs` | `Open` 带默认 `interactive` 字段；新增 `CliWindowEntry`、`CliOpenTarget`、`PromptOpenTarget` / `SetOpenTarget`，追加序列化测试 | CLI 与 Zed 共享目标窗口选择协议（设计文档 16） |
+| H29 | `crates/zed/src/zed/windows_only_instance.rs` | 非交互的 Windows 单实例请求补 `interactive: false`，响应匹配补目标提示的安全回退 | 新协议字段与消息在系统打开转发点保持完整，不弹终端提示 |
+| H30 | `crates/cli/src/main.rs` | stdin TTY 标记；响应循环用 `dialoguer::Select::interact_opt` 选择窗口，默认新窗口，取消与错误分别映射；追加列表与选择结果测试 | 在终端即时选择，不修改默认打开行为设置 |
+| H31 | `crates/zed/src/zed/open_listener.rs` | 在 `resolve_open_behavior` 前接入目标选择；`open_workspaces` 传递显式目标窗口，并保留原项目、激活目标；其他协议匹配补充新消息 | 显式窗口不能沿用只选最前窗口的上游逻辑 |
+| H31 | `crates/zed/src/zed/fork_open_target.rs` | **新文件**，提示门槛、窗口排序/名称、等待选择、取消和失效窗口检查 | fork 专用逻辑集中在子模块，不依赖 `fork_window_switcher` |
+| H31 | `crates/zed/src/zed.rs` | 声明目标选择模块，CLI 请求辅助函数默认非交互，追加 fork CLI 打开测试 | 保留原 CLI 测试行为并覆盖交互式新协议 |
+| H32 | `crates/sidebar/src/sidebar.rs` | 项目身份多选、锚点/拖动范围、可点击折叠箭头、选中背景、移除时清理；复制路径/名字 action 与菜单；Escape 优先清多选 | Finder 式选择与批量复制（设计文档 16），⌘-单击不再折叠 |
+| H32 | `crates/sidebar/src/sidebar_tests.rs` | 旧 ⌘-单击折叠测试改为箭头；追加点击、范围、拖动、复制、多根/远程、菜单范围与移除测试 | 实际鼠标事件和剪贴板断言覆盖新行为 |
 
 计划中的挂钩（还没落地）：
 
@@ -66,7 +74,7 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H15 | 接受上游版本，在 `render_markdown_element` 里重新替换那三行；`preview_theme` 的类型或 `themed_with_overrides` 签名变了就同步调整 `fork_markdown_preview::preview_markdown_style` |
 | H16 | 接受上游版本，重新加 7 个字段和各处的 `// FORK:` 判断。上游改了字段默认值或这几处渲染结构时，保证 `None` 仍然还原成上游原值 |
 | H17 | 接受上游版本，重新加字段并在 `new`、`test_new`、`ensure_project_group_state` 里补回。上游新增了别的分组创建入口时，也要让它读 `fork_new_groups_expanded` |
-| H18 | 接受上游版本，重新对调 `on_click` 的两个分支、改回 `confirm` 的标题分支和菜单提示。上游改了这几处的结构时按设计文档 11 的行为重做 |
+| H18 | 接受上游版本，重新加单击切换项目、`confirm` 的标题分支和菜单提示；⌘-单击按 H32 的多选行为重做，不恢复旧折叠分支 |
 | H19 | 接受上游版本，重新追加文件末尾的 fork 测试段；被改写的那条上游测试再按新行为改一次 |
 | H20 | 接受上游版本，在 `layout_blame_popover` 取到条目后重新收窄行号；不要把 Git 的 1-based 原始行号提前转成 0-based，转换在 diff 选择函数中完成 |
 | H21 | 接受上游版本，重新加偏移查询和 fork 测试；sum tree 游标接口变动时按编译错误调整 |
@@ -77,4 +85,7 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H26 | 接受上游版本，在 `GitRepository` trait 末尾重新加带默认实现的方法和 `CommitShortStat`，在 `RealGitRepository` 的 impl 末尾重新加实现；`GitBinary::run` 签名变了按编译错误调整 |
 | H27 | 接受上游版本，在 `impl Repository` 里重新加 `fork_commit_short_stat`；`RepositoryState::Local` 结构变了按编译错误调整，远程仍直接报不支持 |
 | H28 | 接受上游版本，重新在 `rustflags` 末尾加两个 `--cfg`，在 `[alias]` 前重新加 `[build]` 段；上游自己加了 `[build]` 段时把 `build-dir` 并进去 |
+| H29、H30 | 接受上游版本，重加目标选择消息、TTY 标记与响应分支；保持 Select 默认新窗口，取消返回 130，提示失败回退新窗口 |
+| H31 | 重加模块/插入点及 `open_workspaces` 目标参数，所有 Open 构造点补 interactive；目标窗口先保留原项目再打开。新文件按编译错误跟进公开 API；CLI 测试不能默认等待交互消息 |
+| H32 | 重加身份多选状态、鼠标事件、复制 action/菜单和 Escape 分支；按钮必须阻止事件冒泡，拖动后的 click 不切换；保留设计文档 16 的键位和测试 |
 | `README.md` | 接受上游版本，重新把 `> [!IMPORTANT]` 两行加回文件开头。这两行由人工删除，冲突时不要跟着上游丢掉 |

@@ -246,7 +246,11 @@ fn absolute_timestamp(timestamp: OffsetDateTime, offset: UtcOffset) -> String {
         timestamp.day(),
         ordinal_suffix(timestamp.day()),
         timestamp.year(),
-        if hour % 12 == 0 { 12 } else { hour % 12 },
+        if hour.is_multiple_of(12) {
+            12
+        } else {
+            hour % 12
+        },
         timestamp.minute(),
         if hour < 12 { "AM" } else { "PM" },
     )

@@ -68,9 +68,16 @@ pub enum CliRequest {
         dev_container: bool,
         #[serde(default)]
         cwd: Option<PathBuf>,
+        // FORK: Only the CLI can determine whether terminal selection is available.
+        #[serde(default)]
+        interactive: bool,
     },
     SetOpenBehavior {
         behavior: CliBehaviorSetting,
+    },
+    // FORK: Reply to the per-invocation terminal window picker without changing settings.
+    SetOpenTarget {
+        target: CliOpenTarget,
     },
     /// Print a diagnostic snapshot of the app's GPUI and platform state.
     DebugState,
@@ -79,10 +86,37 @@ pub enum CliRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CliResponse {
     Ping,
-    Stdout { message: String },
-    Stderr { message: String },
-    Exit { status: i32 },
+    Stdout {
+        message: String,
+    },
+    Stderr {
+        message: String,
+    },
+    Exit {
+        status: i32,
+    },
     PromptOpenBehavior,
+    // FORK: The app supplies eligible windows in front-to-back order.
+    PromptOpenTarget {
+        target_name: String,
+        windows: Vec<CliWindowEntry>,
+    },
+}
+
+// FORK: Window ids remain opaque to the CLI and are validated again by Zed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliWindowEntry {
+    pub window_id: u64,
+    pub title: String,
+    pub other_projects: Vec<String>,
+}
+
+// FORK: Cancellation must not fall back to the configured default behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CliOpenTarget {
+    NewWindow,
+    Window(u64),
+    Cancel,
 }
 
 /// When Zed started not as an *.app but as a binary (e.g. local development),
@@ -103,5 +137,59 @@ pub trait CliResponseSink: Send + 'static {
 impl CliResponseSink for ipc::IpcSender<CliResponse> {
     fn send(&self, response: CliResponse) -> Result<()> {
         ipc::IpcSender::send(self, response).map_err(|error| anyhow::anyhow!("{error}"))
+    }
+}
+
+// FORK: Older/internal Open constructors may omit the terminal capability in serialized requests.
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_open_interactive_defaults_to_false() -> Result<()> {
+        let request: CliRequest = serde_json::from_value(serde_json::json!({
+            "Open": {
+                "paths": [], "urls": [], "diff_paths": [], "diff_all": false,
+                "wsl": null, "wait": false, "env": null, "user_data_dir": null,
+                "dev_container": false
+            }
+        }))?;
+        assert!(matches!(
+            request,
+            CliRequest::Open {
+                interactive: false,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cli_open_target_protocol_round_trip() -> Result<()> {
+        for target in [
+            CliOpenTarget::NewWindow,
+            CliOpenTarget::Window(u64::MAX),
+            CliOpenTarget::Cancel,
+        ] {
+            let request = CliRequest::SetOpenTarget { target };
+            let decoded: CliRequest = serde_json::from_str(&serde_json::to_string(&request)?)?;
+            assert!(
+                matches!(decoded, CliRequest::SetOpenTarget { target: decoded } if decoded == target)
+            );
+        }
+        let windows = vec![CliWindowEntry {
+            window_id: u64::MAX,
+            title: "ssh: dev-box infra".into(),
+            other_projects: vec!["工具".into()],
+        }];
+        let response = CliResponse::PromptOpenTarget {
+            target_name: "new-project".into(),
+            windows: windows.clone(),
+        };
+        let decoded: CliResponse = serde_json::from_str(&serde_json::to_string(&response)?)?;
+        assert!(
+            matches!(decoded, CliResponse::PromptOpenTarget { target_name, windows: decoded } if target_name == "new-project" && decoded == windows)
+        );
+        Ok(())
     }
 }

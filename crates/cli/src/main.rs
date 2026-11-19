@@ -14,6 +14,8 @@ use crate::completions::Shell;
 use anyhow::{Context as _, Result};
 use clap::{CommandFactory, Parser};
 use cli::{CliRequest, CliResponse, IpcHandshake, ipc::IpcOneShotServer};
+// FORK: Window selection replies use the same IPC transport as default behavior prompts.
+use cli::{CliOpenTarget, CliWindowEntry};
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -279,6 +281,74 @@ mod tests {
                 SanitizedPath::new(Path::new(&$right))
             )
         };
+    }
+
+    // FORK: These are the exact mappings used by the IPC response loop, including dialoguer's Esc/q None.
+    #[test]
+    fn test_cli_open_target_selection_and_error_fallback() {
+        let windows = vec![CliWindowEntry {
+            window_id: 42,
+            title: "zed".into(),
+            other_projects: vec![],
+        }];
+        assert_eq!(
+            open_target_from_selection(Ok(Some(0)), &windows),
+            CliOpenTarget::NewWindow
+        );
+        assert_eq!(
+            open_target_from_selection(Ok(Some(1)), &windows),
+            CliOpenTarget::Window(42)
+        );
+        assert_eq!(
+            open_target_from_selection(Ok(None), &windows),
+            CliOpenTarget::Cancel
+        );
+        assert_eq!(
+            open_target_from_selection(Ok(Some(usize::MAX)), &windows),
+            CliOpenTarget::NewWindow
+        );
+        let error = io::Error::new(io::ErrorKind::NotConnected, "terminal unavailable");
+        assert_eq!(
+            open_target_from_selection(Err(error.into()), &windows),
+            CliOpenTarget::NewWindow
+        );
+    }
+
+    // FORK: The first/default row is stable and extra sidebar names are limited to three.
+    #[test]
+    fn test_cli_open_target_items() {
+        let windows = vec![
+            CliWindowEntry {
+                window_id: 1,
+                title: "zed".into(),
+                other_projects: vec![],
+            },
+            CliWindowEntry {
+                window_id: 2,
+                title: "ssh: dev-box infra".into(),
+                other_projects: vec!["a".into(), "b".into(), "c".into()],
+            },
+            CliWindowEntry {
+                window_id: 3,
+                title: "tools".into(),
+                other_projects: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            },
+            CliWindowEntry {
+                window_id: 4,
+                title: "工具".into(),
+                other_projects: vec!["a".into()],
+            },
+        ];
+        assert_eq!(
+            open_target_items(&windows),
+            vec![
+                "New window".to_owned(),
+                "zed".to_owned(),
+                "ssh: dev-box infra   (+3: a, b, c)".to_owned(),
+                format!("tools{}(+4: a, b, c, …)", " ".repeat(16)),
+                format!("工具{}(+1: a)", " ".repeat(17)),
+            ]
+        );
     }
 
     fn cwd() -> PathBuf {
@@ -686,6 +756,8 @@ fn run() -> Result<()> {
                     user_data_dir: user_data_dir_for_thread,
                     dev_container: args.dev_container,
                     cwd: env::current_dir().ok(),
+                    // FORK: Non-interactive invocations keep the upstream open behavior.
+                    interactive: io::stdin().is_terminal(),
                 };
 
                 tx.send(if args.debug_state {
@@ -702,6 +774,14 @@ fn run() -> Result<()> {
                         CliResponse::Exit { status } => {
                             exit_status.lock().replace(status);
                             return Ok(());
+                        }
+                        // FORK: Reply even when dialoguer fails so opening does not silently disappear.
+                        CliResponse::PromptOpenTarget {
+                            target_name,
+                            windows,
+                        } => {
+                            let target = prompt_open_target(&target_name, &windows);
+                            tx.send(CliRequest::SetOpenTarget { target })?;
                         }
                         CliResponse::PromptOpenBehavior => {
                             let behavior = prompt_open_behavior()
@@ -799,6 +879,68 @@ fn anonymous_fd(path: &str) -> Option<fs::File> {
         // not implemented for bsd, windows. Could be, but isn't yet
         None
     }
+}
+
+// FORK: Keep selection formatting and result mapping testable without a real terminal.
+fn open_target_items(windows: &[CliWindowEntry]) -> Vec<String> {
+    let title_width = windows
+        .iter()
+        .map(|entry| console::measure_text_width(&entry.title))
+        .max()
+        .unwrap_or(0);
+    std::iter::once("New window".to_owned())
+        .chain(windows.iter().map(|entry| {
+            if entry.other_projects.is_empty() {
+                return entry.title.clone();
+            }
+            // Pad by display width so CJK project names still line up in the terminal.
+            let padding = title_width - console::measure_text_width(&entry.title) + 3;
+            let mut names = entry
+                .other_projects
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>();
+            if entry.other_projects.len() > 3 {
+                names.push("…".into());
+            }
+            format!(
+                "{}{}(+{}: {})",
+                entry.title,
+                " ".repeat(padding),
+                entry.other_projects.len(),
+                names.join(", ")
+            )
+        }))
+        .collect()
+}
+
+fn open_target_from_selection(
+    selection: dialoguer::Result<Option<usize>>,
+    windows: &[CliWindowEntry],
+) -> CliOpenTarget {
+    match selection {
+        Ok(None) => CliOpenTarget::Cancel,
+        Ok(Some(0)) => CliOpenTarget::NewWindow,
+        Ok(Some(selection)) => windows
+            .get(selection.saturating_sub(1))
+            .map_or(CliOpenTarget::NewWindow, |entry| {
+                CliOpenTarget::Window(entry.window_id)
+            }),
+        Err(error) => {
+            eprintln!("Could not select a Zed window: {error}; opening a new window");
+            CliOpenTarget::NewWindow
+        }
+    }
+}
+
+fn prompt_open_target(target_name: &str, windows: &[CliWindowEntry]) -> CliOpenTarget {
+    let selection = dialoguer::Select::new()
+        .with_prompt(format!("Open {target_name} in"))
+        .items(open_target_items(windows))
+        .default(0)
+        .interact_opt();
+    open_target_from_selection(selection, windows)
 }
 
 /// Shows an interactive prompt asking the user to choose the default open
