@@ -9,10 +9,12 @@
 //! clicking a section makes it the active one, so the existing keyboard
 //! navigation and key contexts keep working unchanged.
 
+mod commit_hover;
 mod graph;
 
 use super::*;
-use gpui::{DragMoveEvent, EntityId, FontWeight, Hsla, MouseUpEvent};
+use commit_hover::{CardBadges, CommitHoverState, HoverTarget};
+use gpui::{DragMoveEvent, EntityId, FontWeight, Hsla, MouseUpEvent, ScrollEvent};
 use settings::{
     ForkGitPanelLayout, ForkGitPanelSettingsContent, ProfileBase, RegisterSetting, Settings,
     SettingsContent, SettingsFile, SettingsStore, UserSettingsContentExt,
@@ -142,6 +144,7 @@ pub(super) struct LayoutState {
     /// Set on the first render: the panel's focus handle doesn't exist yet
     /// when this state is built.
     focus_in_subscription: Option<Subscription>,
+    commit_hover: CommitHoverState,
 }
 
 #[derive(Clone)]
@@ -180,6 +183,8 @@ impl LayoutState {
             cx.observe_window_activation(window, |panel, window, cx| {
                 if window.is_window_active() {
                     panel.fork_rescan_repository(cx);
+                } else {
+                    panel.fork_hide_commit_hover(cx);
                 }
             });
         Self {
@@ -193,6 +198,7 @@ impl LayoutState {
             _settings_subscription: settings_subscription,
             _window_activation_subscription: window_activation_subscription,
             focus_in_subscription: None,
+            commit_hover: CommitHoverState::default(),
         }
     }
 }
@@ -267,6 +273,7 @@ impl GitPanel {
 
     fn fork_unload_commit_history(&mut self, cx: &mut Context<Self>) {
         self.fork_layout.history_source = None;
+        self.fork_layout.commit_hover.clear();
         self.set_commit_history(CommitHistory::Loading, cx);
         self._repo_subscriptions.clear();
     }
@@ -290,6 +297,7 @@ impl GitPanel {
         });
         if self.fork_layout.history_source != source {
             self.fork_layout.history_source = source;
+            self.fork_layout.commit_hover.clear_stats();
             self.fork_layout.history_limit =
                 ForkGitPanelLayoutSettings::get_global(cx).graph_page_size;
         }
@@ -365,6 +373,8 @@ impl GitPanel {
         }
         self.fork_sync_commit_editor_mode(cx);
         self.fork_sync_graph(cx);
+        self.fork_validate_commit_hover();
+        self.fork_sync_commit_hover_texts(cx);
         let commit_editor_expanded = self.commit_editor_expanded;
 
         v_flex()
@@ -1066,11 +1076,40 @@ impl GitPanel {
         let has_more = self.fork_layout.history_has_more;
         let shown_limit = self.fork_layout.history_limit;
         let commit_count = entries.len();
+        let graph_width = graph::graph_width(graph_lanes);
+        let hover_card = self
+            .fork_layout
+            .commit_hover
+            .visible_target()
+            .filter(|_| !has_context_menu)
+            .and_then(|target| {
+                let refs = graph
+                    .as_ref()
+                    .and_then(|graph| graph.refs.get(target.index).cloned())
+                    .unwrap_or_default();
+                let color = graph
+                    .as_ref()
+                    .and_then(|graph| graph.rows.get(target.index))
+                    .map_or(cx.theme().colors().text_accent, |row| {
+                        cx.theme().accents().color_for_index(row.color as u32)
+                    });
+                let badges = CardBadges {
+                    head_branch: head_branch.clone(),
+                    remote_names: remote_names.clone(),
+                    filter,
+                    color,
+                    graph_width,
+                };
+                self.fork_commit_hover_card(refs, badges, window, cx)
+            });
 
         v_flex()
             .flex_1()
             .size_full()
             .overflow_hidden()
+            .on_scroll(cx.listener(|this, _: &ScrollEvent, _, cx| {
+                this.fork_hide_commit_hover(cx);
+            }))
             .child(
                 uniform_list(
                     "fork-commit-history",
@@ -1086,7 +1125,6 @@ impl GitPanel {
                                 )
                             });
                         let range = range.start.min(commit_count)..range.end.min(commit_count);
-                        let date_style = GitPanelSettings::get_global(cx).date_style;
                         let theme = cx.theme().clone();
                         let colors = theme.colors();
                         let accents = theme.accents().clone();
@@ -1110,25 +1148,10 @@ impl GitPanel {
                             .map(|(index, data)| {
                                 let entry = &entries[index];
                                 let sha: SharedString = entry.sha.to_string().into();
-                                let short_sha: SharedString =
-                                    sha[..7.min(sha.len())].to_string().into();
-                                let (subject, author, timestamp) = match &data {
-                                    Some(data) => (
-                                        data.subject.clone(),
-                                        data.author_name.clone(),
-                                        Some(data.commit_timestamp),
-                                    ),
-                                    None => ("Loading…".into(), SharedString::default(), None),
+                                let (subject, author) = match &data {
+                                    Some(data) => (data.subject.clone(), data.author_name.clone()),
+                                    None => ("Loading…".into(), SharedString::default()),
                                 };
-                                let time: SharedString = timestamp
-                                    .and_then(|ts| {
-                                        time::OffsetDateTime::from_unix_timestamp(ts).ok()
-                                    })
-                                    .map(|dt| {
-                                        crate::git_timestamp::format_git_date(dt, date_style, cx)
-                                            .into()
-                                    })
-                                    .unwrap_or_default();
 
                                 let is_head = index == 0;
                                 let is_focused = focused_entry == Some(index);
@@ -1146,8 +1169,19 @@ impl GitPanel {
                                         accents.color_for_index(row.color as u32)
                                     });
 
+                                let hover_target = HoverTarget {
+                                    index,
+                                    sha: entry.sha,
+                                };
+                                let card = hover_card
+                                    .as_ref()
+                                    .filter(|(card_index, _)| *card_index == index)
+                                    .map(|(_, card)| card.clone().into_anchor());
+
                                 h_flex()
                                     .id(("fork-commit-history-item", index))
+                                    .debug_selector(|| format!("fork-commit-history-item-{index}"))
+                                    .relative()
                                     .h(HISTORY_ROW_HEIGHT)
                                     .w_full()
                                     .pr_2()
@@ -1187,7 +1221,7 @@ impl GitPanel {
                                             .gap_1p5()
                                             .child(
                                                 div().min_w_0().child(
-                                                    Label::new(subject.clone())
+                                                    Label::new(subject)
                                                         .size(LabelSize::Default)
                                                         .when(is_head, |label| {
                                                             label.weight(FontWeight::BOLD)
@@ -1199,7 +1233,7 @@ impl GitPanel {
                                             .when(!author.is_empty(), |this| {
                                                 this.child(
                                                     div().flex_shrink_0().max_w(px(120.)).child(
-                                                        Label::new(author.clone())
+                                                        Label::new(author)
                                                             .size(LabelSize::Small)
                                                             .color(Color::Muted)
                                                             .single_line()
@@ -1215,31 +1249,30 @@ impl GitPanel {
                                         filter,
                                         is_unpushed,
                                         badge_color,
+                                        MAX_REF_BADGES,
                                         cx,
                                     ))
-                                    .when(!has_context_menu, |this| {
-                                        let meta: SharedString =
-                                            [author.as_ref(), time.as_ref(), short_sha.as_ref()]
-                                                .into_iter()
-                                                .filter(|part| !part.is_empty())
-                                                .collect::<Vec<_>>()
-                                                .join(" · ")
-                                                .into();
-                                        let title = subject.clone();
-                                        this.tooltip(move |_, cx| {
-                                            Tooltip::with_meta(
-                                                title.clone(),
-                                                None,
-                                                meta.clone(),
-                                                cx,
-                                            )
-                                        })
+                                    .children(card)
+                                    .on_hover({
+                                        let git_panel = git_panel.clone();
+                                        move |hovered, _, cx| {
+                                            git_panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.fork_commit_row_hover_changed(
+                                                        hover_target,
+                                                        *hovered,
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
+                                        }
                                     })
                                     .on_mouse_down(MouseButton::Left, {
                                         let git_panel = git_panel.clone();
                                         move |_, _, cx| {
                                             git_panel
                                                 .update(cx, |panel, cx| {
+                                                    panel.fork_hide_commit_hover(cx);
                                                     panel.focused_history_entry = Some(index);
                                                     panel.history_keyboard_nav = false;
                                                     cx.notify();
@@ -1252,6 +1285,7 @@ impl GitPanel {
                                         move |event, window, cx| {
                                             git_panel
                                                 .update(cx, |panel, cx| {
+                                                    panel.fork_hide_commit_hover(cx);
                                                     panel.deploy_history_context_menu(
                                                         event.position,
                                                         index,
@@ -1765,6 +1799,7 @@ fn render_ref_badges(
     filter: ForkGitPanelLayoutSettings,
     is_unpushed: bool,
     color: Hsla,
+    max_badges: usize,
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
@@ -1872,17 +1907,17 @@ fn render_ref_badges(
         );
     }
 
-    let hidden = badges.len().saturating_sub(MAX_REF_BADGES);
+    let hidden = badges.len().saturating_sub(max_badges);
     let hidden_names: SharedString = branches
         .iter()
         .map(|(name, _)| name.clone())
         .chain(lone_remotes.iter().cloned())
         .chain(tags.iter().cloned())
-        .skip(MAX_REF_BADGES)
+        .skip(max_badges)
         .collect::<Vec<_>>()
         .join("\n")
         .into();
-    badges.truncate(MAX_REF_BADGES);
+    badges.truncate(max_badges);
 
     h_flex()
         .flex_none()
@@ -2463,6 +2498,126 @@ mod tests {
         });
         cx.run_until_parked();
         panel.read_with(&cx, |panel, _| assert_eq!(history_len(panel), Some(5)));
+    }
+
+    fn hover_target(panel: &GitPanel, index: usize) -> HoverTarget {
+        let CommitHistory::Loaded(entries) = &panel.commit_history else {
+            panic!("history not loaded");
+        };
+        HoverTarget {
+            index,
+            sha: entries[index].sha,
+        }
+    }
+
+    fn visible_hover(panel: &Entity<GitPanel>, cx: &VisualTestContext) -> Option<usize> {
+        panel.read_with(cx, |panel, _| {
+            panel
+                .fork_layout
+                .commit_hover
+                .visible_target()
+                .map(|target| target.index)
+        })
+    }
+
+    #[gpui::test]
+    async fn test_commit_hover_card_delays(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, panel, mut cx) = panel_with_linear_history(3, None, cx).await;
+        let (first, second) = panel.read_with(&cx, |panel, _| {
+            (hover_target(panel, 0), hover_target(panel, 1))
+        });
+        let hover_row = |target: HoverTarget, hovered: bool, cx: &mut VisualTestContext| {
+            panel.update(cx, |panel, cx| {
+                panel.fork_commit_row_hover_changed(target, hovered, cx)
+            });
+        };
+        let wait = |millis: u64, cx: &mut VisualTestContext| {
+            cx.executor().advance_clock(Duration::from_millis(millis));
+            cx.run_until_parked();
+        };
+
+        // Shows after 500ms, not before.
+        hover_row(first, true, &mut cx);
+        wait(400, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), None);
+        wait(150, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(0));
+
+        // Leaving and coming back within 300ms keeps it.
+        hover_row(first, false, &mut cx);
+        wait(200, &mut cx);
+        hover_row(first, true, &mut cx);
+        wait(400, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(0));
+
+        // Moving to another row switches after 100ms, whichever row reports first.
+        hover_row(second, true, &mut cx);
+        hover_row(first, false, &mut cx);
+        wait(50, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(0));
+        wait(100, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(1));
+
+        // Reaching the card keeps it open past the hide delay.
+        hover_row(second, false, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.fork_commit_card_hover_changed(true, cx)
+        });
+        wait(1000, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(1));
+
+        // Leaving the card hides it after 300ms.
+        panel.update(&mut cx, |panel, cx| {
+            panel.fork_commit_card_hover_changed(false, cx)
+        });
+        wait(200, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(1));
+        wait(150, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), None);
+
+        // Dragging a text selection out of the card keeps it until release.
+        hover_row(first, true, &mut cx);
+        wait(600, &mut cx);
+        hover_row(first, false, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.fork_commit_card_hover_changed(true, cx);
+            panel.fork_commit_card_pressed(true, cx);
+            panel.fork_commit_card_hover_changed(false, cx);
+        });
+        hover_row(second, true, &mut cx);
+        wait(1000, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(0));
+        hover_row(second, false, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.fork_commit_card_pressed(false, cx)
+        });
+        wait(200, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(0));
+        wait(150, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), None);
+
+        // Leaving before the show delay cancels it.
+        hover_row(first, true, &mut cx);
+        wait(300, &mut cx);
+        hover_row(first, false, &mut cx);
+        wait(1000, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), None);
+
+        // Pressing on the row hides it at once; collapsing the graph too.
+        hover_row(first, true, &mut cx);
+        wait(600, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(0));
+        panel.update(&mut cx, |panel, cx| panel.fork_hide_commit_hover(cx));
+        assert_eq!(visible_hover(&panel, &cx), None);
+        hover_row(first, false, &mut cx);
+        hover_row(first, true, &mut cx);
+        wait(600, &mut cx);
+        assert_eq!(visible_hover(&panel, &cx), Some(0));
+        panel.update(&mut cx, |panel, cx| {
+            panel.fork_set_history_collapsed(true, cx)
+        });
+        assert_eq!(visible_hover(&panel, &cx), None);
     }
 
     #[gpui::test]
