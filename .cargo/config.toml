@@ -4,6 +4,12 @@
 # zed_no_bedrock (fork): drop the Amazon Bedrock language model provider and its AWS SDK dependencies
 rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable", "--cfg", "zed_no_webrtc", "--cfg", "zed_no_bedrock"]
 
+# FORK: H28. Each workspace builds into its own target/, overriding a user-level
+# shared build-dir, so git worktrees can build at the same time. See
+# fork/docs/15.worktree构建缓存.md.
+[build]
+build-dir = "{workspace-root}/target"
+
 [alias]
 xtask = "run --package xtask --"
 perf-test = ["test", "--profile", "release-fast", "--lib", "--bins", "--tests", "--all-features", "--config", "target.'cfg(true)'.runner='cargo run -p perf --release'", "--config", "target.'cfg(true)'.rustflags=[\"--cfg\", \"perf_enabled\"]"]

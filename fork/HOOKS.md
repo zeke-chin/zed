@@ -35,6 +35,7 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H24 | `crates/git_ui/src/blame_ui/fork_gitlens_popover.rs` | **新文件**，GitLens 布局、异步 diff、64 项 LRU 缓存和测试 | fork 自有逻辑不散落到上游；缓存包含父 SHA/旧路径并隔离被淘汰任务的异步结果 |
 | H25 | `crates/project/src/manifest_tree/path_trie.rs` | 新发现项目根时允许从 `KnownAbsent` 升级，并清除同一 manifest 标签在后代中的否定缓存；保留嵌套项目根和其他标签 | 避免启动时 LSP 项目根查询遇到 `Present → KnownAbsent` 的旧缓存而触发断言 |
 | H25 | `crates/project/tests/integration/manifest_tree.rs` | 追加项目根缓存升级和后代清理的回归测试 | 覆盖工作树根、嵌套根、多标签和不相关分支 |
+| H28 | `.cargo/config.toml` | `rustflags` 加 `--cfg zed_no_webrtc`、`--cfg zed_no_bedrock`；加 `[build] build-dir = "{workspace-root}/target"` | 两个 cfg 去掉 LiveKit/WebRTC 和 Amazon Bedrock 依赖；`build-dir` 让每个 workspace（含 git worktree）用自己的 `target/`，覆盖用户级共用的 build-dir，worktree 才能并发构建并克隆母本缓存（设计文档 15） |
 
 计划中的挂钩（还没落地）：
 
@@ -71,4 +72,5 @@ fork 对上游已有文件的全部改动。每处挂钩上方都有 `// FORK: <
 | H23 | 接受上游版本，重新加模块声明和按设置分发；renderer 参数变化时同步 H24 的入口 |
 | H24 | fork 自有文件，不会冲突；按编译错误跟进头像、Markdown、CommitView、滚动条等 crate 内部接口变化 |
 | H25 | 接受上游版本；若上游仍未修复项目根的否定缓存失效问题，重加 `insert` 的后代清理、允许 `KnownAbsent → Present` 的断言条件及回归测试 |
+| H28 | 接受上游版本，重新在 `rustflags` 末尾加两个 `--cfg`，在 `[alias]` 前重新加 `[build]` 段；上游自己加了 `[build]` 段时把 `build-dir` 并进去 |
 | `README.md` | 接受上游版本，重新把 `> [!IMPORTANT]` 两行加回文件开头。这两行由人工删除，冲突时不要跟着上游丢掉 |
